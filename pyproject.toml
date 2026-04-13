@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prism-math"
+version = "0.1.0"
+description = "PRISM: Phase-structured Reasoning with Integrated Subject-expert Modules for Olympiad Mathematics"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Debajyoti Dasgupta"}
+]
+keywords = ["math", "reasoning", "olympiad", "vision-language", "NeurIPS"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.9",
+    "transformers>=4.40",
+    "peft>=0.10",
+    "accelerate>=0.28",
+    "datasets>=2.18",
+    "huggingface-hub>=0.22",
+    "safetensors>=0.4",
+    "pillow>=10.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+prism-train   = "prism.training.train_expert:main"
+prism-eval    = "prism.eval.eval_prism:main"
+prism-traces  = "prism.generation.trace_generator:main"
+prism-router  = "prism.training.train_router:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

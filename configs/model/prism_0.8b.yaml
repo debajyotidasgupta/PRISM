@@ -1,0 +1,24 @@
+# PRISMConfig for Qwen3.5-0.8B backbone
+# Full 5-domain, 3-phase PRISM model
+
+backbone_name: "Qwen/Qwen3.5-0.8B"
+n_domains: 5
+n_phases: 3
+hidden_dim: 1536        # Qwen3.5-0.8B hidden dim (check with model.config.hidden_size)
+insert_layer: -1        # auto-detect at 65% depth
+expert_n_heads: 8
+expert_head_dim: 64
+expert_ffn_expansion: 4
+crossmix_n_heads: 4
+router_hidden_dim: 256
+router_dropout: 0.1
+domains:
+  - algebra
+  - geometry
+  - combinatorics
+  - number_theory
+  - miscellaneous
+phases:
+  - solve
+  - verify
+  - correct

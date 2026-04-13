@@ -1,0 +1,49 @@
+# Stage 2: Full PRISM architecture
+# 5 domains × 3 phases = 15 expert blocks + 2 CrossMix modules
+# With cross-domain mixing
+
+backbone_name: "Qwen/Qwen3.5-0.8B"
+n_domains: 5
+n_phases: 3
+hidden_dim: 1536
+insert_layer: -1
+expert_n_heads: 8
+expert_head_dim: 64
+expert_ffn_expansion: 4
+crossmix_n_heads: 4
+router_hidden_dim: 256
+router_dropout: 0.1
+domains:
+  - algebra
+  - geometry
+  - combinatorics
+  - number_theory
+  - miscellaneous
+phases:
+  - solve
+  - verify
+  - correct
+
+# Training schedule
+router_lr: 1e-4
+router_epochs: 5
+expert_lr: 5e-5
+expert_epochs: 3
+crossmix_lr: 2e-5
+crossmix_epochs: 2
+batch_size: 16
+grad_accum_steps: 4
+warmup_steps: 100
+weight_decay: 0.01
+grad_clip: 1.0
+max_seq_len: 2048
+
+# Paths
+traces_dir: "results/traces"
+output_dir: "results/stage2"
+
+# GPU assignment (for reference)
+# GPU 0: algebra + combinatorics (Level 1-3)
+# GPU 1: geometry + miscellaneous (Level 1-3)
+# GPU 2: number_theory (Level 1-3)
+# GPU 3: evaluation + crossmix training

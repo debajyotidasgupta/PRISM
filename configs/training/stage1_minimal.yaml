@@ -1,0 +1,37 @@
+# Stage 1: PRISM minimal architecture
+# 3 domains (Algebra, Geometry, Miscellaneous), 1 phase (Solve only)
+# No cross-domain mixing yet
+
+backbone_name: "Qwen/Qwen3.5-0.8B"
+n_domains: 3
+n_phases: 1
+hidden_dim: 1536
+insert_layer: -1
+expert_n_heads: 8
+expert_head_dim: 64
+expert_ffn_expansion: 4
+crossmix_n_heads: 4
+router_hidden_dim: 256
+router_dropout: 0.1
+domains:
+  - algebra
+  - geometry
+  - miscellaneous
+phases:
+  - solve
+
+# Training
+router_lr: 1e-4
+router_epochs: 5
+expert_lr: 5e-5
+expert_epochs: 3
+batch_size: 16
+grad_accum_steps: 4
+warmup_steps: 100
+weight_decay: 0.01
+grad_clip: 1.0
+max_seq_len: 2048
+
+# Traces
+traces_dir: "results/traces"
+output_dir: "results/stage1"
