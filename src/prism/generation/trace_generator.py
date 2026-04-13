@@ -8,17 +8,14 @@ Two backends are available:
    - Works with any HF-compatible model, no extra deps
    - Use for single-GPU debugging or when vLLM is unavailable
 
-2. VLLMBatchGenerator (fast path — requires vLLM, currently NOT installable)
+2. VLLMBatchGenerator (fast path — vLLM 0.19.0 installed and working)
    - Batched: 3 passes for N problems (all Phase-1 prompts together, etc.)
-   - Continuous batching + PagedAttention → ~10-50× faster than serial
-   - Enable with --use-vllm flag once a compatible vLLM is available
-   - BLOCKED: vLLM 0.19.0 has two hard conflicts with this environment:
-       (a) requires torch==2.10.0  → would replace torch 2.9.0+cu129 and break
-           flash_attn + causal_conv1d (compiled against the CSCS cu129 wheel)
-       (b) requires transformers<5  → would downgrade from 5.5.3 and break
-           Qwen3.5 model loading (needs transformers 5.x API)
-     Resolution: wait for a vLLM release built against torch 2.9.0+cu129 and
-     transformers 5.x, or build vLLM from source on CSCS.
+   - Continuous batching + PagedAttention + prefix caching → ~10-50× faster
+   - Enable with --use-vllm flag (or USE_VLLM=1 in generate_traces.sh)
+   - Installation note: vLLM was installed first (temporarily changing torch to
+     2.10.0 and transformers to 4.57.6), then torch 2.9.0+cu129 and
+     transformers 5.5.3 were restored. causal_conv1d and vllm/flashinfer both
+     work correctly with the restored versions.
 
 Primary teacher: Qwen/Qwen3.5-35B-A3B (35B total, ~3.5B active MoE, fits on 1 GH200)
   - Supports enable_thinking=True for thinking traces
@@ -490,11 +487,11 @@ class VLLMBatchGenerator:
             from vllm import LLM, SamplingParams
         except ImportError as e:
             raise ImportError(
-                "vLLM is not installed (and cannot currently be pip-installed in this "
-                "environment without breaking torch 2.9.0+cu129 or transformers 5.5.3).\n"
-                "Options:\n"
-                "  1. Drop --use-vllm to use the default HF TraceGenerator backend.\n"
-                "  2. Build vLLM from source against torch 2.9.0+cu129 + transformers 5.x.\n"
+                "vLLM is not importable. It should be installed (0.19.0); "
+                "if the environment was recreated, reinstall via:\n"
+                "  pip install vllm==0.19.0\n"
+                "  pip install torch==2.9.0+cu129 --extra-index-url https://download.pytorch.org/whl/cu129\n"
+                "  pip install transformers==5.5.3 huggingface_hub==1.10.1 tokenizers==0.22.2\n"
                 f"  Original error: {e}"
             ) from e
 
