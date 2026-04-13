@@ -1,0 +1,13 @@
+{
+  "domain": "algebra",
+  "verifier_domain": "algebra",
+  "teacher": "Qwen/Qwen3.5-35B-A3B",
+  "backend": "vllm_server",
+  "server_url": "http://localhost:8000",
+  "total": 2500,
+  "phase1_correct": 0,
+  "phase3_correct": 0,
+  "token_filtered": 0,
+  "kept": 0,
+  "pass_rate": 0.0
+}
