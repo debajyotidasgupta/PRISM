@@ -23,6 +23,15 @@ mkdir -p "${LOG_DIR}"
 
 TEACHER="${1:-Qwen/Qwen3.5-35B-A3B}"
 N_PROBLEMS="${2:-2500}"
+# Set USE_VLLM=1 to enable vLLM batch backend (requires compatible vLLM install)
+USE_VLLM="${USE_VLLM:-0}"
+VLLM_FLAG=""
+if [[ "${USE_VLLM}" == "1" ]]; then
+    VLLM_FLAG="--use-vllm"
+    echo "vLLM backend: ENABLED"
+else
+    echo "vLLM backend: disabled (HF serial mode)"
+fi
 
 echo "======================================================"
 echo "PRISM Trace Generation — all 4 GH200 GPUs"
@@ -50,7 +59,7 @@ launch_domain() {
         --n-problems "${N_PROBLEMS}" \
         --gpu     "${GPU}" \
         --output-dir "${PRISM_ROOT}/results/traces" \
-        ${CV_ARG} \
+        ${CV_ARG} ${VLLM_FLAG} \
         > "${LOG_DIR}/traces_${DOMAIN}${SUFFIX}.log" 2>&1 &
     echo "  [GPU${GPU}] ${DOMAIN}${SUFFIX}  PID=$!"
 }

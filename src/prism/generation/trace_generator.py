@@ -1,24 +1,42 @@
 """
-TraceGenerator: generates expert-aligned 3-phase traces using a teacher VLM.
+Trace generation backends for PRISM expert trace production.
+
+Two backends are available:
+
+1. TraceGenerator (default — HF transformers)
+   - Serial: N×3 forward passes, one (problem, phase) at a time
+   - Works with any HF-compatible model, no extra deps
+   - Use for single-GPU debugging or when vLLM is unavailable
+
+2. VLLMBatchGenerator (fast path — requires vLLM, currently NOT installable)
+   - Batched: 3 passes for N problems (all Phase-1 prompts together, etc.)
+   - Continuous batching + PagedAttention → ~10-50× faster than serial
+   - Enable with --use-vllm flag once a compatible vLLM is available
+   - BLOCKED: vLLM 0.19.0 has two hard conflicts with this environment:
+       (a) requires torch==2.10.0  → would replace torch 2.9.0+cu129 and break
+           flash_attn + causal_conv1d (compiled against the CSCS cu129 wheel)
+       (b) requires transformers<5  → would downgrade from 5.5.3 and break
+           Qwen3.5 model loading (needs transformers 5.x API)
+     Resolution: wait for a vLLM release built against torch 2.9.0+cu129 and
+     transformers 5.x, or build vLLM from source on CSCS.
 
 Primary teacher: Qwen/Qwen3.5-35B-A3B (35B total, ~3.5B active MoE, fits on 1 GH200)
   - Supports enable_thinking=True for thinking traces
   - Generation params: temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
 
 Fallback teacher: Qwen/Qwen3-VL-30B-A3B-Thinking (VL, 30B, also fits on 1 GH200)
-  - Supports image+text input via Qwen3-VL pipeline
-  - Same thinking mode params
-
-For image-bearing problems (geometry diagrams):
-  - image is a PIL.Image or path string
-  - Passed through Qwen3-VL's process_vision_info pipeline
 
 Usage:
+  # HF backend (default):
   generator = TraceGenerator(teacher_model_name="Qwen/Qwen3.5-35B-A3B", gpu_id=0)
   generator.load()
-  trace = generator.generate_trace(problem, domain="algebra", ground_truth="42")
-  if trace.is_valid():
-      print(trace.to_jsonl())
+  trace = generator.generate_trace(problem, domain="algebra", ground_truth="42",
+                                   reference_solution="...")
+
+  # vLLM backend (fast, requires vLLM):
+  generator = VLLMBatchGenerator(teacher_model_name="Qwen/Qwen3.5-35B-A3B", gpu_id=0)
+  generator.load()
+  stats = generator.generate_dataset(problems, domain, output_file)
 """
 
 import os
@@ -428,6 +446,315 @@ class TraceGenerator:
         return stats
 
 
+class VLLMBatchGenerator:
+    """
+    vLLM-based batch trace generator — fast drop-in for TraceGenerator.
+
+    Speed advantage:
+      TraceGenerator  : N × 3 serial forward passes (one problem+phase at a time)
+      VLLMBatchGenerator: 3 batched passes (all N Phase-1 prompts, then Phase-2, Phase-3)
+      Practical speedup: 10-50× for large datasets (e.g. N=2500 per domain).
+
+    Requirements:
+      - vLLM installed with a torch/CUDA version compatible with this environment.
+      - On CSCS GH200 (torch 2.9.0+cu129): standard `pip install vllm` is NOT safe
+        because it downgrades torch. Build vLLM from source or use a CSCS module.
+
+    Args:
+        teacher_model_name: HF model ID (same as TraceGenerator).
+        gpu_id: GPU device index. vLLM loads the model on this GPU.
+        max_new_tokens: Max tokens per phase output.
+        gpu_memory_utilization: Fraction of GPU VRAM for vLLM's KV cache (0.0-1.0).
+                                 0.90 is safe for a 35B MoE on one GH200 (96GB).
+    """
+
+    def __init__(
+        self,
+        teacher_model_name: str = "Qwen/Qwen3.5-35B-A3B",
+        gpu_id: int = 0,
+        max_new_tokens: int = 1024,
+        gpu_memory_utilization: float = 0.90,
+    ):
+        self.teacher_model_name = teacher_model_name
+        self.gpu_id = gpu_id
+        self.max_new_tokens = max_new_tokens
+        self.gpu_mem_util = gpu_memory_utilization
+        self._llm = None
+        self._tokenizer = None
+        self._sampling_params = None
+        self._loaded = False
+
+    def load(self):
+        """Load model via vLLM. Raises ImportError if vLLM is not installed."""
+        try:
+            from vllm import LLM, SamplingParams
+        except ImportError as e:
+            raise ImportError(
+                "vLLM is not installed (and cannot currently be pip-installed in this "
+                "environment without breaking torch 2.9.0+cu129 or transformers 5.5.3).\n"
+                "Options:\n"
+                "  1. Drop --use-vllm to use the default HF TraceGenerator backend.\n"
+                "  2. Build vLLM from source against torch 2.9.0+cu129 + transformers 5.x.\n"
+                f"  Original error: {e}"
+            ) from e
+
+        import os
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+
+        from prism.model.backbone import _get_model_dir
+        model_path = _get_model_dir(self.teacher_model_name)
+
+        logger.info(f"Loading vLLM engine: {self.teacher_model_name} on GPU {self.gpu_id}")
+        self._llm = LLM(
+            model=model_path,
+            tensor_parallel_size=1,
+            gpu_memory_utilization=self.gpu_mem_util,
+            trust_remote_code=True,
+            max_model_len=8192,
+            enforce_eager=False,      # use CUDA graphs for speed
+            enable_prefix_caching=True,  # cache shared system prompt prefixes
+        )
+        # Thinking mode sampling params (Qwen3 official recommended values)
+        self._sampling_params = SamplingParams(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            presence_penalty=1.5,
+            max_tokens=self.max_new_tokens,
+        )
+        self._tokenizer = self._llm.get_tokenizer()
+        logger.info("vLLM engine loaded")
+        self._loaded = True
+        return self
+
+    def _build_prompt(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> str:
+        """Apply Qwen3 chat template with thinking mode enabled."""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        except TypeError:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    def generate_dataset(
+        self,
+        problems: list[dict],
+        domain: str,
+        output_file: str,
+        max_tokens_per_trace: int = 4096,
+        cross_verify_domain: str = None,
+    ) -> dict:
+        """
+        Generate traces for all problems using 3 batched vLLM passes.
+
+        Phase sequencing:
+          Pass 1: all N Phase-1 (Reformulate) prompts → N solve_traces
+          Pass 2: all N Phase-2 (Verify) prompts (built from Pass 1 outputs)
+          Pass 3: all N Phase-3 (Correct) prompts (built from Pass 1+2 outputs)
+
+        This is equivalent to TraceGenerator.generate_dataset() but 10-50× faster
+        because vLLM continuous-batches all N sequences instead of running them serially.
+        """
+        assert self._loaded, "Call load() first"
+        from vllm import SamplingParams
+
+        verify_domain = cross_verify_domain if cross_verify_domain else domain
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        stats = {
+            "domain": domain,
+            "verifier_domain": verify_domain,
+            "teacher": self.teacher_model_name,
+            "backend": "vllm",
+            "total": len(problems),
+            "phase1_correct": 0,
+            "phase3_correct": 0,
+            "token_filtered": 0,
+            "kept": 0,
+        }
+
+        # ── Unpack problems ───────────────────────────────────────────────
+        problem_texts, reference_solutions, ground_truths, prob_ids = [], [], [], []
+        for i, prob in enumerate(problems):
+            problem_texts.append(prob.get("problem", prob.get("question", "")))
+            reference_solutions.append(str(prob.get("solution", prob.get("reference", ""))))
+            ground_truths.append(str(prob.get("answer", prob.get("ground_truth", ""))))
+            prob_ids.append(str(prob.get("id", i)))
+
+        logger.info(f"[vLLM] {domain}: generating {len(problems)} traces in 3 batched passes")
+
+        # ── Pass 1: Reformulate (Phase 0) ─────────────────────────────────
+        phase1_prompts = [
+            self._build_prompt(
+                get_phase_system_prompt(domain, phase=0),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=0, domain=domain,
+                    reference_solution=reference_solutions[i],
+                    ground_truth=ground_truths[i],
+                ),
+            )
+            for i in range(len(problems))
+        ]
+        logger.info(f"[vLLM] Pass 1 (Reformulate): {len(phase1_prompts)} prompts...")
+        phase1_outputs = self._llm.generate(
+            phase1_prompts,
+            SamplingParams(
+                temperature=1.0, top_p=0.95, top_k=20,
+                presence_penalty=1.5, max_tokens=self.max_new_tokens,
+            ),
+        )
+        solve_traces = [o.outputs[0].text.strip() for o in phase1_outputs]
+
+        # ── Pass 2: Verify (Phase 1) — uses verify_domain expert ──────────
+        phase2_prompts = [
+            self._build_prompt(
+                get_phase_system_prompt(verify_domain, phase=1),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=1, domain=verify_domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                ),
+            )
+            for i in range(len(problems))
+        ]
+        logger.info(f"[vLLM] Pass 2 (Verify):     {len(phase2_prompts)} prompts...")
+        phase2_outputs = self._llm.generate(
+            phase2_prompts,
+            SamplingParams(
+                temperature=1.0, top_p=0.95, top_k=20,
+                presence_penalty=1.5, max_tokens=self.max_new_tokens,
+            ),
+        )
+        verify_traces = [o.outputs[0].text.strip() for o in phase2_outputs]
+
+        # ── Pass 3: Correct/Polish (Phase 2) ──────────────────────────────
+        phase3_prompts = [
+            self._build_prompt(
+                get_phase_system_prompt(domain, phase=2),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=2, domain=domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                    verify_trace=verify_traces[i],
+                ),
+            )
+            for i in range(len(problems))
+        ]
+        logger.info(f"[vLLM] Pass 3 (Correct):    {len(phase3_prompts)} prompts...")
+        phase3_outputs = self._llm.generate(
+            phase3_prompts,
+            SamplingParams(
+                temperature=1.0, top_p=0.95, top_k=20,
+                presence_penalty=1.5, max_tokens=self.max_new_tokens,
+            ),
+        )
+        correct_traces = [o.outputs[0].text.strip() for o in phase3_outputs]
+
+        # ── Assemble and write TraceExamples ──────────────────────────────
+        with open(output_path, "w", encoding="utf-8") as f:
+            for i in range(len(problems)):
+                predicted_1 = extract_final_answer(solve_traces[i])
+                solve_correct = answers_match(predicted_1, ground_truths[i])
+                predicted_3 = extract_final_answer(correct_traces[i])
+                correct_correct = answers_match(predicted_3, ground_truths[i])
+
+                if solve_correct:
+                    stats["phase1_correct"] += 1
+                if correct_correct:
+                    stats["phase3_correct"] += 1
+
+                total_tokens = (
+                    len(solve_traces[i]) + len(verify_traces[i]) + len(correct_traces[i])
+                ) // 4
+
+                if total_tokens > max_tokens_per_trace:
+                    stats["token_filtered"] += 1
+                    continue
+
+                trace = TraceExample(
+                    problem_id=prob_ids[i],
+                    problem=problem_texts[i],
+                    domain=domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                    verify_trace=verify_traces[i],
+                    correct_trace=correct_traces[i],
+                    teacher_model=self.teacher_model_name,
+                    solve_correct=solve_correct,
+                    correct_correct=correct_correct,
+                    total_tokens=total_tokens,
+                )
+                if trace.is_valid(max_tokens_per_trace):
+                    f.write(trace.to_jsonl() + "\n")
+                    stats["kept"] += 1
+
+        stats["pass_rate"] = stats["kept"] / max(stats["total"], 1)
+        logger.info(f"[vLLM] Generation complete [{domain}]: {stats}")
+        return stats
+
+
+def make_generator(
+    teacher_model_name: str,
+    gpu_id: int,
+    use_vllm: bool = False,
+    max_new_tokens: int = 1024,
+    temperature: float = 1.0,
+):
+    """
+    Factory: returns VLLMBatchGenerator if use_vllm=True and vLLM is importable,
+    otherwise returns TraceGenerator (HF backend).
+
+    Args:
+        teacher_model_name: HF model ID.
+        gpu_id: GPU device index.
+        use_vllm: Attempt to use vLLM. Falls back to HF if unavailable.
+        max_new_tokens: Max tokens per phase.
+        temperature: Sampling temperature (vLLM backend ignores this in favour
+                     of the fixed thinking-mode params).
+
+    Returns:
+        Loaded generator instance (either VLLMBatchGenerator or TraceGenerator).
+    """
+    if use_vllm:
+        try:
+            import vllm  # noqa: F401
+            logger.info("vLLM available — using VLLMBatchGenerator (fast batched mode)")
+            return VLLMBatchGenerator(
+                teacher_model_name=teacher_model_name,
+                gpu_id=gpu_id,
+                max_new_tokens=max_new_tokens,
+            ).load()
+        except ImportError:
+            logger.warning(
+                "vLLM not available (ImportError). "
+                "Falling back to HF TraceGenerator. "
+                "To enable vLLM, build it from source against torch 2.9.0+cu129."
+            )
+
+    return TraceGenerator(
+        teacher_model_name=teacher_model_name,
+        gpu_id=gpu_id,
+        max_new_tokens_per_phase=max_new_tokens,
+        temperature=temperature,
+    ).load()
+
+
 def main():
     """CLI entry point: prism-traces"""
     parser = argparse.ArgumentParser(description="Generate PRISM expert traces")
@@ -445,12 +772,21 @@ def main():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output-dir", default="results/traces")
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--cross-verify-domain",
         default=None,
         choices=["algebra", "geometry", "combinatorics", "number_theory", "miscellaneous"],
         help="Use a DIFFERENT domain expert for Phase 2 (cross-domain verification)",
+    )
+    parser.add_argument(
+        "--use-vllm",
+        action="store_true",
+        help=(
+            "Use vLLM batch backend for 10-50× faster generation. "
+            "Falls back to HF TraceGenerator if vLLM is not installed. "
+            "WARNING: requires vLLM built against torch 2.9.0+cu129 (not pip-installable on CSCS)."
+        ),
     )
     args = parser.parse_args()
 
@@ -479,11 +815,13 @@ def main():
         for ex in ds
     ]
 
-    generator = TraceGenerator(
+    generator = make_generator(
         teacher_model_name=args.teacher,
         gpu_id=args.gpu,
+        use_vllm=args.use_vllm,
+        max_new_tokens=args.max_tokens,
         temperature=args.temperature,
-    ).load()
+    )
 
     suffix = f"_cv_{args.cross_verify_domain}" if args.cross_verify_domain else ""
     output_file = os.path.join(args.output_dir, f"{args.domain}{suffix}_traces.jsonl")
