@@ -85,3 +85,13 @@ echo "======================================================"
 echo "Stage 0 LoRA training complete: $(date)"
 echo "======================================================"
 ls -lh "${OUTPUT_DIR}"
+
+# ── Push adapters and eval results to upstream ────────────────────────────
+echo ""
+echo "Pushing LoRA adapters to GitHub..."
+cd "${PRISM_ROOT}"
+git add results/stage0/ 2>/dev/null || true
+git diff --cached --quiet || \
+    git commit -m "feat: Stage 0 LoRA adapters [$(date +%Y-%m-%d)]" && \
+    git push origin main && echo "Pushed adapters to origin/main" || \
+    echo "WARNING: git push failed (check credentials)"

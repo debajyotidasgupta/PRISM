@@ -77,6 +77,13 @@ while true; do
 done
 echo "Round 1 complete: $(date)"
 
+# Push Round 1 stats immediately
+cd "${PRISM_ROOT}"
+git add results/traces/*_stats.json 2>/dev/null || true
+git diff --cached --quiet || \
+    git commit -m "chore: Round 1 trace stats [$(date +%Y-%m-%d)]" && \
+    git push origin main && echo "Round 1 stats pushed" || true
+
 # ══════════════════════════════════════════════════════════════════════════
 # Round 2: miscellaneous primary + cross-domain verification pairs
 # ══════════════════════════════════════════════════════════════════════════
@@ -113,3 +120,13 @@ ls -lh "${PRISM_ROOT}/results/traces/"
 echo ""
 echo "Stats files:"
 ls "${PRISM_ROOT}/results/traces/"*_stats.json 2>/dev/null || echo "  (none found)"
+
+# ── Push stats to upstream ────────────────────────────────────────────────
+echo ""
+echo "Pushing stats to GitHub..."
+cd "${PRISM_ROOT}"
+git add results/traces/*_stats.json 2>/dev/null || true
+git diff --cached --quiet || \
+    git commit -m "chore: add trace generation stats [$(date +%Y-%m-%d)]" && \
+    git push origin main && echo "Pushed stats to origin/main" || \
+    echo "WARNING: git push failed (check credentials)"
