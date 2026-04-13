@@ -12,7 +12,9 @@ pip install -e .
 ## Run POC (small end-to-end test, ~20 problems per domain)
 
 ```bash
+# Uses Qwen/Qwen3.5-35B-A3B as teacher (35B MoE, VL, fits on 1 GH200)
 python scripts/poc_trace_gen.py --n-problems 20 --gpu 0
+# Secondary (faster, smaller): --teacher Qwen/Qwen3-VL-8B-Instruct
 ```
 
 ## Full pipeline

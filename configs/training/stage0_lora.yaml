@@ -22,7 +22,8 @@ lora_dropout: 0.05
 # Data
 n_per_domain: 2500
 trace_max_tokens: 4096
-teacher_model: "Qwen/Qwen2.5-VL-7B-Instruct"
+teacher_model: "Qwen/Qwen3.5-35B-A3B"
+teacher_model_secondary: "Qwen/Qwen3-VL-8B-Instruct"
 
 # Training
 epochs: 3

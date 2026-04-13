@@ -105,6 +105,10 @@ class TraceGenerator:
         import os
         hf_token = os.environ.get("HF_TOKEN", None)
 
+        # Restrict this process to the assigned GPU (physical → logical cuda:0)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
         # Resolve model path (from /tmp or HF cache)
         from prism.model.backbone import _get_model_dir
         model_path = _get_model_dir(self.teacher_model_name)
@@ -117,7 +121,7 @@ class TraceGenerator:
         model_kwargs = dict(
             dtype=self.dtype,       # note: use dtype not torch_dtype for newer transformers
             trust_remote_code=True,
-            device_map=f"cuda:{self.gpu_id}",
+            device_map="cuda:0",    # always cuda:0 since CUDA_VISIBLE_DEVICES restricts to one GPU
         )
         if hf_token:
             model_kwargs["token"] = hf_token
@@ -306,6 +310,7 @@ class TraceGenerator:
             ground_truth=ground_truth,
         )
         solve_trace = self._generate_phase(sys1, usr1, image=image)
+        torch.cuda.empty_cache()
 
         predicted_1 = extract_final_answer(solve_trace)
         solve_correct = answers_match(predicted_1, ground_truth)
@@ -318,6 +323,7 @@ class TraceGenerator:
             solve_trace=solve_trace,
         )
         verify_trace = self._generate_phase(sys2, usr2, image=image)
+        torch.cuda.empty_cache()
 
         # ─── Phase 3: Produce final polished solution ──────────────────────
         sys3 = get_phase_system_prompt(domain, phase=2)
@@ -491,19 +497,26 @@ class VLLMBatchGenerator:
 
         import os
         os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        # Use FlashInfer backend: bypasses vLLM's bundled flash_attn C extension
+        # (compiled for CUDA 12, fails on CUDA 13 / GH200)
+        os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+        # Force FA2 for VIT encoder: FA3 crashes on GH200 CUDA 13 during encoder profiling
+        os.environ.setdefault("VLLM_FLASH_ATTN_VERSION", "2")
 
         from prism.model.backbone import _get_model_dir
         model_path = _get_model_dir(self.teacher_model_name)
 
-        logger.info(f"Loading vLLM engine: {self.teacher_model_name} on GPU {self.gpu_id}")
+        logger.info(f"Loading vLLM engine: {self.teacher_model_name} on GPU {self.gpu_id} "
+                    f"(VLLM_ATTENTION_BACKEND={os.environ['VLLM_ATTENTION_BACKEND']})")
         self._llm = LLM(
             model=model_path,
             tensor_parallel_size=1,
             gpu_memory_utilization=self.gpu_mem_util,
             trust_remote_code=True,
             max_model_len=8192,
-            enforce_eager=False,      # use CUDA graphs for speed
-            enable_prefix_caching=True,  # cache shared system prompt prefixes
+            enforce_eager=True,          # skip CUDA graphs for CUDA 13 compatibility
+            enable_prefix_caching=True,
+            limit_mm_per_prompt={"image": 0},  # text-only: skip VIT encoder cache profiling
         )
         # Thinking mode sampling params (Qwen3 official recommended values)
         self._sampling_params = SamplingParams(
@@ -731,11 +744,10 @@ def make_generator(
                 gpu_id=gpu_id,
                 max_new_tokens=max_new_tokens,
             ).load()
-        except ImportError:
+        except Exception as e:
             logger.warning(
-                "vLLM not available (ImportError). "
-                "Falling back to HF TraceGenerator. "
-                "To enable vLLM, build it from source against torch 2.9.0+cu129."
+                f"vLLM load failed ({type(e).__name__}: {e}). "
+                "Falling back to HF TraceGenerator."
             )
 
     return TraceGenerator(
@@ -762,7 +774,7 @@ def main():
     parser.add_argument("--n-problems", type=int, default=2500)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output-dir", default="results/traces")
-    parser.add_argument("--max-tokens", type=int, default=4096)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--cross-verify-domain",
@@ -830,6 +842,14 @@ def main():
     stats_file = os.path.join(args.output_dir, f"{args.domain}{suffix}_stats.json")
     with open(stats_file, "w") as f:
         json.dump(stats, f, indent=2)
+
+    # Flush any pending GPU memory
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
