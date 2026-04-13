@@ -1,18 +1,20 @@
 """
 TraceGenerator: generates expert-aligned 3-phase traces using a teacher VLM.
 
-Teacher model: Qwen/Qwen3-VL-30B-A3B-Thinking (VL, 30B total, 3B active MoE)
-  - Supports image+text input
-  - Fits on one GH200 (96GB) in fp16
-  - Uses Qwen3 thinking mode ENABLED (enable_thinking=True)
+Primary teacher: Qwen/Qwen3.5-35B-A3B (35B total, ~3.5B active MoE, fits on 1 GH200)
+  - Supports enable_thinking=True for thinking traces
   - Generation params: temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
+
+Fallback teacher: Qwen/Qwen3-VL-30B-A3B-Thinking (VL, 30B, also fits on 1 GH200)
+  - Supports image+text input via Qwen3-VL pipeline
+  - Same thinking mode params
 
 For image-bearing problems (geometry diagrams):
   - image is a PIL.Image or path string
   - Passed through Qwen3-VL's process_vision_info pipeline
 
 Usage:
-  generator = TraceGenerator(teacher_model_name="Qwen/Qwen3-VL-30B-A3B-Thinking", gpu_id=0)
+  generator = TraceGenerator(teacher_model_name="Qwen/Qwen3.5-35B-A3B", gpu_id=0)
   generator.load()
   trace = generator.generate_trace(problem, domain="algebra", ground_truth="42")
   if trace.is_valid():
@@ -39,9 +41,10 @@ from prism.generation.phase_prompts import (
 
 logger = logging.getLogger(__name__)
 
-# Supported VL teacher models (>14B only)
+# Supported teacher models (>14B only)
 VL_TEACHER_MODELS = {
-    "Qwen/Qwen3-VL-30B-A3B-Thinking",  # Primary — 30B VL, thinking mode, 1 GH200
+    "Qwen/Qwen3.5-35B-A3B",             # Primary — 35B MoE, ~3.5B active, enable_thinking, 1 GH200
+    "Qwen/Qwen3-VL-30B-A3B-Thinking",   # Fallback — 30B VL, thinking mode, 1 GH200
 }
 
 
@@ -64,7 +67,7 @@ class TraceGenerator:
 
     def __init__(
         self,
-        teacher_model_name: str = "Qwen/Qwen3-VL-30B-A3B-Thinking",
+        teacher_model_name: str = "Qwen/Qwen3.5-35B-A3B",
         gpu_id: int = 0,
         max_new_tokens_per_phase: int = 1024,
         temperature: float = 1.0,
@@ -408,8 +411,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate PRISM expert traces")
     parser.add_argument(
         "--teacher",
-        default="Qwen/Qwen3-VL-30B-A3B-Thinking",
-        help="Teacher VL model HF ID (must be >14B)",
+        default="Qwen/Qwen3.5-35B-A3B",
+        help="Teacher model HF ID (must be >14B; fallback: Qwen/Qwen3-VL-30B-A3B-Thinking)",
     )
     parser.add_argument(
         "--domain",

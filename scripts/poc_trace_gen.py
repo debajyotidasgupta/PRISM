@@ -5,15 +5,16 @@ Tests the complete trace generation pipeline on a small subset (n_problems per d
 BEFORE scaling to the full dataset.
 
 What this validates:
-  1. Teacher model loads correctly (Qwen3-VL-30B-A3B-Thinking — image+text VL model)
+  1. Teacher model loads correctly (Qwen3.5-35B-A3B — primary, enable_thinking)
   2. VL input works: image+text problems processed correctly
   3. All 3 phase prompts produce coherent, domain-aligned traces
   4. Both single-domain and cross-domain verification traces work
   5. Quality filter correctly identifies correct/incorrect traces
   6. JSONL output is parseable by the data pipeline
 
-Teacher: Qwen/Qwen3-VL-30B-A3B-Thinking (30B params, 3B active MoE — fits on 1 GH200)
-  - enable_thinking=True, temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
+Teacher: Qwen/Qwen3.5-35B-A3B (primary, 35B MoE, ~3.5B active — fits on 1 GH200)
+  Fallback: Qwen/Qwen3-VL-30B-A3B-Thinking
+  Both: enable_thinking=True, temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
 Student: Qwen/Qwen3.5-0.8B (also VL — image+text)
 
 Usage:
@@ -161,7 +162,7 @@ def _make_synthetic_problems(domain: str, n: int) -> list[dict]:
 def run_poc(
     n_problems: int = 20,
     gpu_id: int = 0,
-    teacher_model: str = "Qwen/Qwen3-VL-30B-A3B-Thinking",
+    teacher_model: str = "Qwen/Qwen3.5-35B-A3B",
     output_dir: str = "results/traces/poc",
     with_images: bool = False,
     test_crossdomain_verify: bool = True,
@@ -187,7 +188,7 @@ def run_poc(
 
     logger.info("=" * 60)
     logger.info(f"PRISM POC Trace Generation")
-    logger.info(f"Teacher: {teacher_model}  [thinking=True, T=1.0, top_p=0.95, top_k=20]")
+    logger.info(f"Teacher: {teacher_model}  [enable_thinking=True, T=1.0, top_p=0.95, top_k=20]")
     logger.info(f"Problems per domain: {n_problems}")
     logger.info(f"GPU: {gpu_id}")
     logger.info(f"Cross-domain verify: {test_crossdomain_verify}")
@@ -401,8 +402,8 @@ def main():
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index")
     parser.add_argument(
         "--teacher",
-        default="Qwen/Qwen3-VL-30B-A3B-Thinking",
-        help="Teacher VL model HF ID (must be >14B; Qwen3-VL-30B-A3B-Thinking fits on 1 GH200)",
+        default="Qwen/Qwen3.5-35B-A3B",
+        help="Teacher model HF ID (must be >14B; primary=Qwen3.5-35B-A3B, fallback=Qwen3-VL-30B-A3B-Thinking)",
     )
     parser.add_argument("--output-dir", default="results/traces/poc")
     parser.add_argument("--with-images", action="store_true", help="Test VL image input")
