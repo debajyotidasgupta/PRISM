@@ -236,25 +236,19 @@ class TraceGenerator:
 
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Thinking mode generation params per Qwen3 official docs:
-        # temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
+        # Thinking mode generation params (presence_penalty is OpenAI/vLLM only,
+        # not supported by HF generate — use repetition_penalty as HF equivalent)
         generate_kwargs = dict(
             max_new_tokens=self.max_new_tokens,
             do_sample=True,
             temperature=self.temperature,   # 1.0 for thinking mode
             top_p=0.95,
             top_k=20,
+            repetition_penalty=1.05,        # mild repetition suppression (HF equivalent)
             pad_token_id=self._processor.tokenizer.eos_token_id,
         )
-        # presence_penalty supported in newer transformers
-        try:
-            generate_kwargs["presence_penalty"] = 1.5
-            with torch.no_grad():
-                output_ids = self._model.generate(**inputs, **generate_kwargs)
-        except TypeError:
-            generate_kwargs.pop("presence_penalty", None)
-            with torch.no_grad():
-                output_ids = self._model.generate(**inputs, **generate_kwargs)
+        with torch.no_grad():
+            output_ids = self._model.generate(**inputs, **generate_kwargs)
 
         input_len = inputs["input_ids"].shape[1]
         new_tokens = output_ids[0][input_len:]
