@@ -12,7 +12,14 @@ core_*
 *.pth
 *.ckpt
 
-# But allow small result files
+# results/ — large training data excluded, small stats/adapters tracked
+results/traces/*.jsonl
+results/traces/poc/*.jsonl
+results/logs/
+results/stage0/checkpoints/
+results/stage1/checkpoints/
+results/stage2/checkpoints/
+# Allow final small outputs
 !results/stage0/lora_adapters/*.safetensors
 !results/stage1/expert_blocks/*.safetensors
 !results/stage2/expert_blocks/*.safetensors
