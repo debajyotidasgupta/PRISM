@@ -774,7 +774,12 @@ def main():
     parser.add_argument("--n-problems", type=int, default=2500)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output-dir", default="results/traces")
-    parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--max-tokens", type=int, default=2048,
+                        help="Max NEW tokens to generate per phase.")
+    parser.add_argument("--filter-tokens", type=int, default=16384,
+                        help="Max total tokens (all 3 phases combined) to keep a trace. "
+                             "Traces exceeding this are discarded as too long for training. "
+                             "Default 16384 ≈ 4096 tokens/phase × 4 chars/token.")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument(
         "--cross-verify-domain",
@@ -832,7 +837,7 @@ def main():
         problems=problems,
         domain=args.domain,
         output_file=output_file,
-        max_tokens_per_trace=args.max_tokens,
+        max_tokens_per_trace=args.filter_tokens,
         cross_verify_domain=args.cross_verify_domain,
     )
 

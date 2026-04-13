@@ -64,9 +64,18 @@ class TraceExample:
     def from_jsonl(cls, line: str) -> "TraceExample":
         return cls.from_dict(json.loads(line))
 
-    def is_valid(self, max_tokens: int = 4096) -> bool:
-        """Check quality filter: Phase 3 answer correct, total tokens ≤ max."""
-        return self.correct_correct and self.total_tokens <= max_tokens
+    def is_valid(self, max_tokens: int = 65536) -> bool:
+        """
+        Check quality filter: all 3 phases non-empty, total tokens ≤ max.
+
+        Note: correct_correct is tracked as a quality stat but NOT used to
+        filter here — the reformulation approach (giving teacher the correct
+        answer) means the trace is valid even if answers_match() fails due
+        to LaTeX normalization edge cases.
+        """
+        if not self.solve_trace or not self.verify_trace or not self.correct_trace:
+            return False
+        return self.total_tokens <= max_tokens
 
 
 def parse_trace(raw_output: str) -> dict:
