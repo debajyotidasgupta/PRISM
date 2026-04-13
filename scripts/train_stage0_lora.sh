@@ -20,7 +20,7 @@ fi
 
 TRACES_DIR="${PRISM_ROOT}/results/traces"
 OUTPUT_DIR="${PRISM_ROOT}/results/stage0/lora_adapters"
-LOG_DIR=/tmp/prism_logs
+LOG_DIR="${PRISM_LOG_DIR:-${PRISM_ROOT}/results/logs}"
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
 
 echo "======================================================"

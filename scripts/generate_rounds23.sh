@@ -15,7 +15,7 @@ ROUND1_PIDS=("$1" "$2" "$3" "$4")
 TEACHER="${5:-Qwen/Qwen3.5-35B-A3B}"
 N_PROBLEMS="${6:-2500}"
 
-LOG_DIR=/tmp/prism_logs
+LOG_DIR="${PRISM_LOG_DIR:-${PRISM_ROOT}/results/logs}"
 mkdir -p "${LOG_DIR}"
 
 # Always use vLLM
@@ -42,12 +42,17 @@ launch_domain() {
         CV_ARG="--cross-verify-domain ${CROSS_VERIFY}"
     fi
 
+    CUDA_VISIBLE_DEVICES=${GPU} \
+    TORCHDYNAMO_DISABLE=1 \
+    VLLM_ATTENTION_BACKEND=FLASHINFER \
+    VLLM_FLASH_ATTN_VERSION=2 \
     nohup python -m prism.generation.trace_generator \
         --teacher "${TEACHER}" \
         --domain  "${DOMAIN}" \
         --n-problems "${N_PROBLEMS}" \
         --gpu     "${GPU}" \
         --output-dir "${PRISM_ROOT}/results/traces" \
+        --max-tokens 2048 \
         ${CV_ARG} ${VLLM_FLAG} \
         > "${LOG_DIR}/traces_${DOMAIN}${SUFFIX}.log" 2>&1 &
     echo "  [GPU${GPU}] ${DOMAIN}${SUFFIX}  PID=$!"
