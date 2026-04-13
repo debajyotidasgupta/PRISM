@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
-# Parallel trace generation across all 4 GPUs
-# Each GPU generates one domain's traces simultaneously
+# Full trace generation across all 4 GH200 GPUs.
+#
+# GPU allocation strategy — maximize utilization:
+#   GPU 0: algebra (primary domain traces)
+#   GPU 1: geometry + combinatorics cross-verify pairs
+#   GPU 2: combinatorics (primary) + algebra→misc cross-verify
+#   GPU 3: number_theory + miscellaneous (sequential on same GPU)
+#
+# After primary traces are done, cross-domain verification pairs run on
+# whichever GPUs finish first. All 4 GPUs stay busy throughout.
+#
+# Usage:
+#   bash scripts/generate_traces.sh [TEACHER] [N_PROBLEMS]
+#   bash scripts/generate_traces.sh Qwen/Qwen3.5-35B-A3B 2500
 
 set -euo pipefail
 source "$(dirname "$0")/setup/env.sh"
@@ -9,54 +21,92 @@ cd "${PRISM_ROOT}"
 LOG_DIR=/tmp/prism_logs
 mkdir -p "${LOG_DIR}"
 
-TEACHER="${1:-Qwen/Qwen2.5-VL-7B-Instruct}"
+TEACHER="${1:-Qwen/Qwen3.5-35B-A3B}"
 N_PROBLEMS="${2:-2500}"
 
-echo "Generating traces: teacher=${TEACHER}, n_per_domain=${N_PROBLEMS}"
-echo "Started: $(date)"
+echo "======================================================"
+echo "PRISM Trace Generation — all 4 GH200 GPUs"
+echo "Teacher : ${TEACHER}"
+echo "N/domain: ${N_PROBLEMS}"
+echo "Started : $(date)"
+echo "======================================================"
 
-# GPU 0: algebra
-nohup python -m prism.generation.trace_generator \
-    --teacher "${TEACHER}" --domain algebra \
-    --n-problems "${N_PROBLEMS}" --gpu 0 \
-    --output-dir "${PRISM_ROOT}/results/traces" \
-    > "${LOG_DIR}/traces_algebra.log" 2>&1 &
-echo "Algebra GPU0 PID=$!"
+# ── Helper: launch one domain on one GPU ──────────────────────────────────
+launch_domain() {
+    local DOMAIN=$1
+    local GPU=$2
+    local CROSS_VERIFY="${3:-}"   # optional cross-verify-domain arg
 
-# GPU 1: geometry
-nohup python -m prism.generation.trace_generator \
-    --teacher "${TEACHER}" --domain geometry \
-    --n-problems "${N_PROBLEMS}" --gpu 1 \
-    --output-dir "${PRISM_ROOT}/results/traces" \
-    > "${LOG_DIR}/traces_geometry.log" 2>&1 &
-echo "Geometry GPU1 PID=$!"
+    local SUFFIX=""
+    local CV_ARG=""
+    if [[ -n "${CROSS_VERIFY}" ]]; then
+        SUFFIX="_cv_${CROSS_VERIFY}"
+        CV_ARG="--cross-verify-domain ${CROSS_VERIFY}"
+    fi
 
-# GPU 2: combinatorics
-nohup python -m prism.generation.trace_generator \
-    --teacher "${TEACHER}" --domain combinatorics \
-    --n-problems "${N_PROBLEMS}" --gpu 2 \
-    --output-dir "${PRISM_ROOT}/results/traces" \
-    > "${LOG_DIR}/traces_combinatorics.log" 2>&1 &
-echo "Combinatorics GPU2 PID=$!"
+    nohup python -m prism.generation.trace_generator \
+        --teacher "${TEACHER}" \
+        --domain  "${DOMAIN}" \
+        --n-problems "${N_PROBLEMS}" \
+        --gpu     "${GPU}" \
+        --output-dir "${PRISM_ROOT}/results/traces" \
+        ${CV_ARG} \
+        > "${LOG_DIR}/traces_${DOMAIN}${SUFFIX}.log" 2>&1 &
+    echo "  [GPU${GPU}] ${DOMAIN}${SUFFIX}  PID=$!"
+}
 
-# GPU 3: number_theory (start first, then miscellaneous after)
-nohup python -m prism.generation.trace_generator \
-    --teacher "${TEACHER}" --domain number_theory \
-    --n-problems "${N_PROBLEMS}" --gpu 3 \
-    --output-dir "${PRISM_ROOT}/results/traces" \
-    > "${LOG_DIR}/traces_nt.log" 2>&1 &
-echo "NumberTheory GPU3 PID=$!"
-
-wait
-
-# GPU 3: miscellaneous (runs after number_theory)
-nohup python -m prism.generation.trace_generator \
-    --teacher "${TEACHER}" --domain miscellaneous \
-    --n-problems "${N_PROBLEMS}" --gpu 3 \
-    --output-dir "${PRISM_ROOT}/results/traces" \
-    > "${LOG_DIR}/traces_misc.log" 2>&1 &
-echo "Miscellaneous GPU3 PID=$!"
+# ══════════════════════════════════════════════════════════════════════════
+# Round 1: Primary domain traces — all 4 GPUs simultaneously
+# ══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── Round 1: primary domain traces ──────────────────────"
+launch_domain algebra        0
+launch_domain geometry       1
+launch_domain combinatorics  2
+launch_domain number_theory  3
 
 wait
+echo ""
+echo "Round 1 complete: $(date)"
+echo "Primary traces done: algebra, geometry, combinatorics, number_theory"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Round 2: miscellaneous primary + cross-domain verification pairs
+# 4 tasks distributed across 4 GPUs
+# ══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── Round 2: miscellaneous + cross-verify pairs ──────────"
+launch_domain miscellaneous  0          # GPU 0: last primary domain
+launch_domain algebra        1  miscellaneous     # GPU 1: algebra → verified by misc
+launch_domain geometry       2  algebra            # GPU 2: geometry → verified by algebra
+launch_domain combinatorics  3  number_theory      # GPU 3: combinatorics → verified by NT
+
+wait
+echo ""
+echo "Round 2 complete: $(date)"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Round 3: remaining cross-domain verification pairs
+# ══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── Round 3: remaining cross-verify pairs ────────────────"
+launch_domain number_theory  0  algebra            # GPU 0: NT → verified by algebra
+launch_domain miscellaneous  1  combinatorics      # GPU 1: misc → verified by combinatorics
+launch_domain algebra        2  geometry           # GPU 2: algebra → verified by geometry
+launch_domain geometry       3  combinatorics      # GPU 3: geometry → verified by combinatorics
+
+wait
+echo ""
+echo "Round 3 complete: $(date)"
+
+# ══════════════════════════════════════════════════════════════════════════
+# Summary
+# ══════════════════════════════════════════════════════════════════════════
+echo ""
+echo "======================================================"
 echo "All trace generation complete: $(date)"
-ls -la "${PRISM_ROOT}/results/traces/"
+echo "======================================================"
+ls -lh "${PRISM_ROOT}/results/traces/"
+echo ""
+echo "Stats files:"
+ls "${PRISM_ROOT}/results/traces/"*_stats.json 2>/dev/null || echo "  (none found)"

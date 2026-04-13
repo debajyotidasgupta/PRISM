@@ -250,6 +250,7 @@ class TraceGenerator:
         problem: str,
         domain: str,
         ground_truth: str,
+        reference_solution: str = "",
         problem_id: str = "",
         image=None,
         cross_verify_domain: str = None,
@@ -257,15 +258,25 @@ class TraceGenerator:
         """
         Generate a full 3-phase trace for one problem.
 
+        The teacher is NEVER asked to solve from scratch. Instead:
+          Phase 1: Reformulate `reference_solution` in expert domain style.
+          Phase 2: Verify the Phase 1 trace against the known `ground_truth`.
+          Phase 3: Produce final polished solution using Phase 1 + Phase 2.
+
+        This ensures high-quality traces regardless of whether the teacher
+        can independently solve olympiad-level problems.
+
         For standard traces: all 3 phases use the same domain expert.
-        For cross-domain verification: Phase 2 (Verify) uses a DIFFERENT domain expert.
-        This models the scenario where an algebra problem is checked using
-        combinatorial or inequality-based tools.
+        For cross-domain verification: Phase 2 uses a DIFFERENT domain expert,
+        modelling scenarios where an algebra problem is verified via combinatorics.
 
         Args:
             problem: Problem text.
             domain: Primary PRISM domain for Phases 1 and 3.
-            ground_truth: Expected final answer.
+            ground_truth: Known correct final answer (used by Phase 2/3 for grounding).
+            reference_solution: Full worked solution from the source dataset. This is
+                                 given to Phase 1 so the teacher reformulates it rather
+                                 than solving from scratch. If empty, ground_truth is used.
             problem_id: Unique identifier for this problem.
             image: PIL Image or path for geometry/VL problems.
             cross_verify_domain: If provided, use THIS domain for Phase 2 (verify).
@@ -278,27 +289,34 @@ class TraceGenerator:
 
         verify_domain = cross_verify_domain if cross_verify_domain else domain
 
-        # ─── Phase 1: Solve (primary domain) ──────────────────────────────
+        # ─── Phase 1: Reformulate reference solution in expert style ──────
         sys1 = get_phase_system_prompt(domain, phase=0)
-        usr1 = get_phase_user_prompt(problem, phase=0, domain=domain)
+        usr1 = get_phase_user_prompt(
+            problem, phase=0, domain=domain,
+            reference_solution=reference_solution,
+            ground_truth=ground_truth,
+        )
         solve_trace = self._generate_phase(sys1, usr1, image=image)
 
         predicted_1 = extract_final_answer(solve_trace)
         solve_correct = answers_match(predicted_1, ground_truth)
 
-        # ─── Phase 2: Verify (potentially DIFFERENT domain expert) ─────────
+        # ─── Phase 2: Verify trace (potentially DIFFERENT domain expert) ──
         sys2 = get_phase_system_prompt(verify_domain, phase=1)
         usr2 = get_phase_user_prompt(
             problem, phase=1, domain=verify_domain,
-            solve_trace=solve_trace
+            ground_truth=ground_truth,
+            solve_trace=solve_trace,
         )
         verify_trace = self._generate_phase(sys2, usr2, image=image)
 
-        # ─── Phase 3: Correct (primary domain, uses both previous outputs) ─
+        # ─── Phase 3: Produce final polished solution ──────────────────────
         sys3 = get_phase_system_prompt(domain, phase=2)
         usr3 = get_phase_user_prompt(
             problem, phase=2, domain=domain,
-            solve_trace=solve_trace, verify_trace=verify_trace
+            ground_truth=ground_truth,
+            solve_trace=solve_trace,
+            verify_trace=verify_trace,
         )
         correct_trace = self._generate_phase(sys3, usr3, image=image)
 
@@ -364,14 +382,18 @@ class TraceGenerator:
             for i, prob in enumerate(tqdm(problems, desc=f"Traces: {domain}")):
                 try:
                     problem_text = prob.get("problem", prob.get("question", ""))
-                    answer = str(prob.get("answer", prob.get("solution", "")))
+                    # reference_solution: full worked solution (e.g. MATH dataset's "solution" field)
+                    # ground_truth: the short final answer for correctness checking
+                    reference_solution = str(prob.get("solution", prob.get("reference", "")))
+                    ground_truth = str(prob.get("answer", prob.get("ground_truth", reference_solution)))
                     prob_id = str(prob.get("id", i))
                     image = prob.get("image", None)
 
                     trace = self.generate_trace(
                         problem=problem_text,
                         domain=domain,
-                        ground_truth=answer,
+                        ground_truth=ground_truth,
+                        reference_solution=reference_solution,
                         problem_id=prob_id,
                         image=image,
                         cross_verify_domain=cross_verify_domain,
@@ -449,6 +471,8 @@ def main():
     problems = [
         {
             "problem": ex.get("problem", ex.get("question", "")),
+            # Full worked solution passed as reference for Phase 1 reformulation
+            "solution": ex.get("solution", ""),
             "answer": ex.get("answer", ex.get("solution", "")),
             "id": str(ex.get("id", "")),
         }
