@@ -116,9 +116,18 @@ class TraceGenerator:
         logger.info(f"Loading VL teacher: {self.teacher_model_name} on GPU {self.gpu_id}")
 
         # VL models need AutoModelForImageTextToText (Qwen3-VL, Qwen3.5, Qwen2.5-VL all use this)
-        from transformers import AutoModelForImageTextToText, AutoProcessor
+        from transformers import AutoModelForImageTextToText, AutoProcessor, AutoConfig
+
+        # Patch config before loading: Qwen3_5MoeConfig lacks pad_token_id which some
+        # nn.Embedding calls require. Set it to eos_token_id if missing.
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True,
+                                                  token=hf_token)
+        if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
+            model_config.pad_token_id = getattr(model_config, "eos_token_id", 0)
+            logger.info(f"Patched missing pad_token_id → {model_config.pad_token_id}")
 
         model_kwargs = dict(
+            config=model_config,
             dtype=self.dtype,       # note: use dtype not torch_dtype for newer transformers
             trust_remote_code=True,
             device_map="cuda:0",    # always cuda:0 since CUDA_VISIBLE_DEVICES restricts to one GPU
@@ -515,8 +524,8 @@ class VLLMBatchGenerator:
             trust_remote_code=True,
             max_model_len=8192,
             enforce_eager=True,          # skip CUDA graphs for CUDA 13 compatibility
-            enable_prefix_caching=True,
-            limit_mm_per_prompt={"image": 0},  # text-only: skip VIT encoder cache profiling
+            enable_prefix_caching=False, # prefix caching + VL model triggers encoder profiling
+            limit_mm_per_prompt={"image": 0, "video": 0},  # suppress ALL multimodal profiling
         )
         # Thinking mode sampling params (Qwen3 official recommended values)
         self._sampling_params = SamplingParams(
@@ -713,32 +722,294 @@ class VLLMBatchGenerator:
         return stats
 
 
+class VLLMServerGenerator:
+    """
+    Trace generator that targets a running vLLM OpenAI-compatible server.
+
+    All N prompts for each phase are fired concurrently as async HTTP requests.
+    The server's continuous-batching scheduler handles queueing and optimal
+    batching automatically — no EngineCore lifecycle issues, no OOM from
+    competing processes, and better utilisation than the Python LLM API.
+
+    Usage:
+        bash scripts/start_vllm_servers.sh   # starts 4 servers on ports 8000-8003
+        python -m prism.generation.trace_generator \\
+            --domain algebra --server-url http://localhost:8000
+
+    Args:
+        teacher_model_name: HF model ID (used for tokenizer + metadata only).
+        server_url: Base URL of the vLLM OpenAI-compatible server.
+        max_new_tokens: Max tokens to generate per phase.
+        concurrency: Max simultaneous in-flight HTTP requests (server still
+                     batches them all; this only limits connection count).
+    """
+
+    def __init__(
+        self,
+        teacher_model_name: str = "Qwen/Qwen3.5-35B-A3B",
+        server_url: str = "http://localhost:8000",
+        max_new_tokens: int = 2048,
+        concurrency: int = 512,
+    ):
+        self.teacher_model_name = teacher_model_name
+        self.server_url = server_url.rstrip("/")
+        self.max_new_tokens = max_new_tokens
+        self.concurrency = concurrency
+        self._model_id = None
+        self._tokenizer = None
+        self._loaded = False
+
+    def load(self):
+        """Connect to server and load tokenizer (CPU-only, fast)."""
+        import urllib.request
+        import json as _json
+
+        # Discover the model ID served at this endpoint
+        try:
+            with urllib.request.urlopen(f"{self.server_url}/v1/models", timeout=15) as r:
+                self._model_id = _json.loads(r.read())["data"][0]["id"]
+            logger.info(f"vLLM server ready at {self.server_url} — model: {self._model_id}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Cannot reach vLLM server at {self.server_url}: {e}\n"
+                "Start it with:  bash scripts/start_vllm_servers.sh"
+            ) from e
+
+        # Tokenizer only (no weights) — needed for chat-template formatting
+        from prism.model.backbone import _get_model_dir
+        model_path = _get_model_dir(self.teacher_model_name)
+        from transformers import AutoTokenizer
+        self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        logger.info("Tokenizer loaded for prompt formatting")
+        self._loaded = True
+        return self
+
+    def _format_prompt(self, system: str, user: str) -> str:
+        """Apply Qwen3.5 chat template with thinking mode; return raw text."""
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ]
+        try:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            )
+        except TypeError:
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    async def _gather_completions(self, prompts: list[str]) -> list[str]:
+        """Fire all prompts concurrently; return completions in original order."""
+        import asyncio
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(
+            base_url=f"{self.server_url}/v1",
+            api_key="dummy",
+            timeout=900.0,          # 15-min ceiling; long traces need time
+            max_retries=0,
+        )
+        sem = asyncio.Semaphore(self.concurrency)
+
+        async def one(prompt: str, idx: int) -> tuple[int, str]:
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        resp = await client.completions.create(
+                            model=self._model_id,
+                            prompt=prompt,
+                            max_tokens=self.max_new_tokens,
+                            temperature=1.0,
+                            top_p=0.95,
+                            extra_body={"top_k": 20, "presence_penalty": 1.5},
+                        )
+                        return idx, resp.choices[0].text.strip()
+                    except Exception as e:
+                        if attempt == 2:
+                            logger.warning(f"Request {idx} failed after 3 attempts: {e}")
+                            return idx, ""
+                        await asyncio.sleep(2 ** attempt)
+                return idx, ""
+
+        results = await asyncio.gather(*[one(p, i) for i, p in enumerate(prompts)])
+        results.sort(key=lambda x: x[0])
+        return [text for _, text in results]
+
+    def _run_phase(self, prompts: list[str], label: str) -> list[str]:
+        """Synchronous wrapper: runs async gather in a fresh event loop."""
+        import asyncio
+        logger.info(f"[Server→{self.server_url}] {label}: {len(prompts)} concurrent requests")
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self._gather_completions(prompts))
+        finally:
+            loop.close()
+
+    def generate_dataset(
+        self,
+        problems: list[dict],
+        domain: str,
+        output_file: str,
+        max_tokens_per_trace: int = 65536,
+        cross_verify_domain: str = None,
+    ) -> dict:
+        """Same interface as VLLMBatchGenerator.generate_dataset()."""
+        assert self._loaded, "Call load() first"
+
+        verify_domain = cross_verify_domain or domain
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        stats = {
+            "domain": domain,
+            "verifier_domain": verify_domain,
+            "teacher": self.teacher_model_name,
+            "backend": "vllm_server",
+            "server_url": self.server_url,
+            "total": len(problems),
+            "phase1_correct": 0,
+            "phase3_correct": 0,
+            "token_filtered": 0,
+            "kept": 0,
+        }
+
+        problem_texts, reference_solutions, ground_truths, prob_ids = [], [], [], []
+        for i, prob in enumerate(problems):
+            problem_texts.append(prob.get("problem", prob.get("question", "")))
+            reference_solutions.append(str(prob.get("solution", prob.get("reference", ""))))
+            ground_truths.append(str(prob.get("answer", prob.get("ground_truth", ""))))
+            prob_ids.append(str(prob.get("id", i)))
+
+        N = len(problems)
+
+        # ── Pass 1: Reformulate ───────────────────────────────────────────
+        p1 = [
+            self._format_prompt(
+                get_phase_system_prompt(domain, phase=0),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=0, domain=domain,
+                    reference_solution=reference_solutions[i],
+                    ground_truth=ground_truths[i],
+                ),
+            )
+            for i in range(N)
+        ]
+        solve_traces = self._run_phase(p1, "Pass 1 (Reformulate)")
+
+        # ── Pass 2: Verify ────────────────────────────────────────────────
+        p2 = [
+            self._format_prompt(
+                get_phase_system_prompt(verify_domain, phase=1),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=1, domain=verify_domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                ),
+            )
+            for i in range(N)
+        ]
+        verify_traces = self._run_phase(p2, "Pass 2 (Verify)")
+
+        # ── Pass 3: Correct ───────────────────────────────────────────────
+        p3 = [
+            self._format_prompt(
+                get_phase_system_prompt(domain, phase=2),
+                get_phase_user_prompt(
+                    problem_texts[i], phase=2, domain=domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                    verify_trace=verify_traces[i],
+                ),
+            )
+            for i in range(N)
+        ]
+        correct_traces = self._run_phase(p3, "Pass 3 (Correct)")
+
+        # ── Assemble and write ────────────────────────────────────────────
+        with open(output_path, "w", encoding="utf-8") as f:
+            for i in range(N):
+                predicted_1 = extract_final_answer(solve_traces[i])
+                solve_correct = answers_match(predicted_1, ground_truths[i])
+                predicted_3 = extract_final_answer(correct_traces[i])
+                correct_correct = answers_match(predicted_3, ground_truths[i])
+
+                if solve_correct:
+                    stats["phase1_correct"] += 1
+                if correct_correct:
+                    stats["phase3_correct"] += 1
+
+                total_tokens = (
+                    len(solve_traces[i]) + len(verify_traces[i]) + len(correct_traces[i])
+                ) // 4
+
+                if total_tokens > max_tokens_per_trace:
+                    stats["token_filtered"] += 1
+                    continue
+
+                trace = TraceExample(
+                    problem_id=prob_ids[i],
+                    problem=problem_texts[i],
+                    domain=domain,
+                    ground_truth=ground_truths[i],
+                    solve_trace=solve_traces[i],
+                    verify_trace=verify_traces[i],
+                    correct_trace=correct_traces[i],
+                    teacher_model=self.teacher_model_name,
+                    solve_correct=solve_correct,
+                    correct_correct=correct_correct,
+                    total_tokens=total_tokens,
+                )
+                if trace.is_valid(max_tokens_per_trace):
+                    f.write(trace.to_jsonl() + "\n")
+                    stats["kept"] += 1
+
+        stats["pass_rate"] = stats["kept"] / max(stats["total"], 1)
+        logger.info(f"[Server] Generation complete [{domain}]: {stats}")
+        return stats
+
+
 def make_generator(
     teacher_model_name: str,
-    gpu_id: int,
+    gpu_id: int = 0,
     use_vllm: bool = False,
+    server_url: str = None,
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
 ):
     """
-    Factory: returns VLLMBatchGenerator if use_vllm=True and vLLM is importable,
-    otherwise returns TraceGenerator (HF backend).
+    Factory: returns the best available generator.
+
+    Priority:
+      1. VLLMServerGenerator  — if server_url is provided
+      2. VLLMBatchGenerator   — if use_vllm=True and vLLM importable
+      3. TraceGenerator       — HF fallback
 
     Args:
         teacher_model_name: HF model ID.
-        gpu_id: GPU device index.
-        use_vllm: Attempt to use vLLM. Falls back to HF if unavailable.
+        gpu_id: GPU index (ignored when server_url is set).
+        use_vllm: Use vLLM Python API (loads model in-process).
+        server_url: URL of a running vLLM server (preferred over use_vllm).
         max_new_tokens: Max tokens per phase.
-        temperature: Sampling temperature (vLLM backend ignores this in favour
-                     of the fixed thinking-mode params).
-
-    Returns:
-        Loaded generator instance (either VLLMBatchGenerator or TraceGenerator).
+        temperature: Sampling temperature (vLLM backends use fixed thinking params).
     """
+    if server_url:
+        logger.info(f"Using vLLM server mode → {server_url}")
+        return VLLMServerGenerator(
+            teacher_model_name=teacher_model_name,
+            server_url=server_url,
+            max_new_tokens=max_new_tokens,
+        ).load()
+
     if use_vllm:
         try:
             import vllm  # noqa: F401
-            logger.info("vLLM available — using VLLMBatchGenerator (fast batched mode)")
+            logger.info("vLLM available — using VLLMBatchGenerator (in-process)")
             return VLLMBatchGenerator(
                 teacher_model_name=teacher_model_name,
                 gpu_id=gpu_id,
@@ -791,9 +1062,17 @@ def main():
         "--use-vllm",
         action="store_true",
         help=(
-            "Use vLLM batch backend for 10-50× faster generation. "
-            "Falls back to HF TraceGenerator if vLLM is not installed. "
-            "WARNING: requires vLLM built against torch 2.9.0+cu129 (not pip-installable on CSCS)."
+            "Use vLLM in-process batch backend. "
+            "Prefer --server-url when a vLLM server is already running."
+        ),
+    )
+    parser.add_argument(
+        "--server-url",
+        default=None,
+        help=(
+            "URL of a running vLLM OpenAI-compatible server, e.g. http://localhost:8000. "
+            "All prompts are sent concurrently; the server handles batching. "
+            "Start servers with:  bash scripts/start_vllm_servers.sh"
         ),
     )
     args = parser.parse_args()
@@ -827,6 +1106,7 @@ def main():
         teacher_model_name=args.teacher,
         gpu_id=args.gpu,
         use_vllm=args.use_vllm,
+        server_url=args.server_url,
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
     )
