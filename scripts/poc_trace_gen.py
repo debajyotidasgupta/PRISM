@@ -5,14 +5,15 @@ Tests the complete trace generation pipeline on a small subset (n_problems per d
 BEFORE scaling to the full dataset.
 
 What this validates:
-  1. Teacher model loads correctly (Qwen3-VL-30B-A3B — image+text VL model)
+  1. Teacher model loads correctly (Qwen3-VL-30B-A3B-Thinking — image+text VL model)
   2. VL input works: image+text problems processed correctly
   3. All 3 phase prompts produce coherent, domain-aligned traces
   4. Both single-domain and cross-domain verification traces work
   5. Quality filter correctly identifies correct/incorrect traces
   6. JSONL output is parseable by the data pipeline
 
-Teacher: Qwen/Qwen3-VL-30B-A3B (30B params, 3B active MoE — fits on 1 GH200)
+Teacher: Qwen/Qwen3-VL-30B-A3B-Thinking (30B params, 3B active MoE — fits on 1 GH200)
+  - enable_thinking=True, temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
 Student: Qwen/Qwen3.5-0.8B (also VL — image+text)
 
 Usage:
@@ -71,36 +72,47 @@ CROSS_VERIFY_PAIRS = [
 
 
 def load_poc_problems(domain: str, n: int) -> list[dict]:
-    """Load n problems for the POC from MATH dataset."""
+    """Load n problems for the POC from MATH dataset (EleutherAI/hendrycks_math)."""
     import os
     os.environ.setdefault("HF_HOME", "/iopsstor/scratch/cscs/dasgupta/research/ideas/PRISM/.cache/huggingface")
 
-    try:
-        from datasets import load_dataset
-        logger.info(f"Loading MATH dataset for domain={domain}, n={n}")
-        ds = load_dataset(
-            "hendrycks/competition_math",
-            split="train",
-            cache_dir=os.environ.get("HF_HOME"),
-            trust_remote_code=True,
-        )
-    except Exception as e:
-        logger.error(f"Failed to load MATH dataset: {e}")
+    from datasets import load_dataset, concatenate_datasets
+    from prism.data.datasets import MATH_LABEL_MAP
+
+    # Load all MATH configs and concatenate (EleutherAI mirror has per-subject splits)
+    MATH_CONFIGS = [
+        "algebra", "counting_and_probability", "geometry",
+        "intermediate_algebra", "number_theory", "prealgebra", "precalculus",
+    ]
+    all_datasets = []
+    for config in MATH_CONFIGS:
+        try:
+            sub_ds = load_dataset(
+                "EleutherAI/hendrycks_math",
+                config,
+                split="train",
+                cache_dir=os.environ.get("HF_HOME"),
+            )
+            all_datasets.append(sub_ds)
+            logger.info(f"  Loaded MATH/{config}: {len(sub_ds)} examples")
+        except Exception as e:
+            logger.warning(f"  Could not load MATH/{config}: {e}")
+
+    if not all_datasets:
+        logger.error("Failed to load any MATH config — falling back to synthetic problems")
         return _make_synthetic_problems(domain, n)
 
-    from prism.data.datasets import MATH_LABEL_MAP
-    from prism.data.domain_split import classify_domain
+    ds = concatenate_datasets(all_datasets)
+    logger.info(f"MATH total: {len(ds)} examples across {len(all_datasets)} configs")
 
     problems = []
     for ex in ds:
         if len(problems) >= n:
             break
-        # Map MATH type to PRISM domain
         math_type = ex.get("type", "")
         prism_domain = MATH_LABEL_MAP.get(math_type, "miscellaneous")
         if prism_domain != domain:
             continue
-        # Level filter
         level_str = ex.get("level", "Level 1")
         try:
             level = int(level_str.replace("Level ", "").strip())
@@ -149,7 +161,7 @@ def _make_synthetic_problems(domain: str, n: int) -> list[dict]:
 def run_poc(
     n_problems: int = 20,
     gpu_id: int = 0,
-    teacher_model: str = "Qwen/Qwen3-VL-30B-A3B",
+    teacher_model: str = "Qwen/Qwen3-VL-30B-A3B-Thinking",
     output_dir: str = "results/traces/poc",
     with_images: bool = False,
     test_crossdomain_verify: bool = True,
@@ -175,7 +187,7 @@ def run_poc(
 
     logger.info("=" * 60)
     logger.info(f"PRISM POC Trace Generation")
-    logger.info(f"Teacher: {teacher_model}")
+    logger.info(f"Teacher: {teacher_model}  [thinking=True, T=1.0, top_p=0.95, top_k=20]")
     logger.info(f"Problems per domain: {n_problems}")
     logger.info(f"GPU: {gpu_id}")
     logger.info(f"Cross-domain verify: {test_crossdomain_verify}")
@@ -190,7 +202,7 @@ def run_poc(
             teacher_model_name=teacher_model,
             gpu_id=gpu_id,
             max_new_tokens_per_phase=512,  # Shorter for POC
-            temperature=0.7,
+            temperature=1.0,   # Thinking mode requires temperature=1.0
         ).load()
         logger.info("Teacher model loaded successfully")
     except Exception as e:
@@ -389,8 +401,8 @@ def main():
     parser.add_argument("--gpu", type=int, default=0, help="GPU device index")
     parser.add_argument(
         "--teacher",
-        default="Qwen/Qwen3-VL-30B-A3B",
-        help="Teacher VL model HF ID",
+        default="Qwen/Qwen3-VL-30B-A3B-Thinking",
+        help="Teacher VL model HF ID (must be >14B; Qwen3-VL-30B-A3B-Thinking fits on 1 GH200)",
     )
     parser.add_argument("--output-dir", default="results/traces/poc")
     parser.add_argument("--with-images", action="store_true", help="Test VL image input")

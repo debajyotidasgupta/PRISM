@@ -111,10 +111,10 @@ def load_math_dataset(
     max_samples: Optional[int] = None,
 ) -> Dataset:
     """
-    Load Hendrycks MATH dataset.
+    Load Hendrycks MATH dataset via EleutherAI mirror.
 
     Args:
-        split: "train" or "test" (we use "train" only for training).
+        split: "train" or "test" (use "train" only for training).
         domain: Filter to this PRISM domain.
         level_min/max: Filter by difficulty level (1=easiest, 5=hardest).
 
@@ -122,12 +122,28 @@ def load_math_dataset(
         Dataset with columns: problem, solution, type, level, prism_domain
     """
     logger.info(f"Loading MATH [{split}]")
-    ds = load_dataset(
-        "hendrycks/competition_math",
-        split=split,
-        cache_dir=_hf_cache_dir(),
-        trust_remote_code=True,
-    )
+    # Load all 7 math categories and concatenate
+    MATH_CONFIGS = ["algebra", "counting_and_probability", "geometry",
+                    "intermediate_algebra", "number_theory", "prealgebra", "precalculus"]
+    all_datasets = []
+    for config in MATH_CONFIGS:
+        try:
+            sub_ds = load_dataset(
+                "EleutherAI/hendrycks_math",
+                config,
+                split=split,
+                cache_dir=_hf_cache_dir(),
+            )
+            all_datasets.append(sub_ds)
+        except Exception as e:
+            logger.warning(f"Could not load MATH config {config}: {e}")
+
+    if not all_datasets:
+        logger.error("Could not load any MATH split")
+        return Dataset.from_dict({"problem": [], "solution": [], "prism_domain": []})
+
+    from datasets import concatenate_datasets
+    ds = concatenate_datasets(all_datasets)
 
     def _process(example):
         math_type = example.get("type", "")

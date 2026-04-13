@@ -1,17 +1,18 @@
 """
 TraceGenerator: generates expert-aligned 3-phase traces using a teacher VLM.
 
-Teacher model: Qwen/Qwen3-VL-30B-A3B (VL, 30B total, 3B active MoE)
+Teacher model: Qwen/Qwen3-VL-30B-A3B-Thinking (VL, 30B total, 3B active MoE)
   - Supports image+text input
   - Fits on one GH200 (96GB) in fp16
-  - Uses Qwen3 thinking mode disabled during generation
+  - Uses Qwen3 thinking mode ENABLED (enable_thinking=True)
+  - Generation params: temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
 
 For image-bearing problems (geometry diagrams):
   - image is a PIL.Image or path string
   - Passed through Qwen3-VL's process_vision_info pipeline
 
 Usage:
-  generator = TraceGenerator(teacher_model_name="Qwen/Qwen3-VL-30B-A3B", gpu_id=0)
+  generator = TraceGenerator(teacher_model_name="Qwen/Qwen3-VL-30B-A3B-Thinking", gpu_id=0)
   generator.load()
   trace = generator.generate_trace(problem, domain="algebra", ground_truth="42")
   if trace.is_valid():
@@ -38,12 +39,9 @@ from prism.generation.phase_prompts import (
 
 logger = logging.getLogger(__name__)
 
-# Supported VL teacher models
+# Supported VL teacher models (>14B only)
 VL_TEACHER_MODELS = {
-    "Qwen/Qwen3-VL-30B-A3B",       # Primary — 30B total, 3B active, 1 GH200
-    "Qwen/Qwen2.5-VL-72B-Instruct", # Most capable, needs 2+ GH200
-    "Qwen/Qwen2.5-VL-7B-Instruct",  # Secondary — smaller, faster
-    "Qwen/Qwen3-VL-7B-A3B",         # Alternative
+    "Qwen/Qwen3-VL-30B-A3B-Thinking",  # Primary — 30B VL, thinking mode, 1 GH200
 }
 
 
@@ -66,10 +64,10 @@ class TraceGenerator:
 
     def __init__(
         self,
-        teacher_model_name: str = "Qwen/Qwen3-VL-30B-A3B",
+        teacher_model_name: str = "Qwen/Qwen3-VL-30B-A3B-Thinking",
         gpu_id: int = 0,
         max_new_tokens_per_phase: int = 1024,
-        temperature: float = 0.7,
+        temperature: float = 1.0,
         torch_dtype=torch.float16,
     ):
         self.teacher_model_name = teacher_model_name
@@ -95,18 +93,24 @@ class TraceGenerator:
 
         logger.info(f"Loading VL teacher: {self.teacher_model_name} on GPU {self.gpu_id}")
 
-        # Use AutoModelForCausalLM for Qwen3-VL (it handles VL natively)
-        from transformers import AutoModelForCausalLM, AutoProcessor
+        # VL models need AutoModelForImageTextToText (Qwen3-VL, Qwen3.5, Qwen2.5-VL all use this)
+        from transformers import AutoModelForImageTextToText, AutoProcessor
 
         model_kwargs = dict(
-            torch_dtype=self.dtype,
+            dtype=self.dtype,       # note: use dtype not torch_dtype for newer transformers
             trust_remote_code=True,
             device_map=f"cuda:{self.gpu_id}",
         )
         if hf_token:
             model_kwargs["token"] = hf_token
 
-        self._model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
+        try:
+            self._model = AutoModelForImageTextToText.from_pretrained(model_path, **model_kwargs)
+        except Exception as e:
+            logger.warning(f"AutoModelForImageTextToText failed ({e}), trying AutoModelForCausalLM")
+            from transformers import AutoModelForCausalLM
+            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
+            self._model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
         self._model.eval()
 
         self._processor = AutoProcessor.from_pretrained(
@@ -174,17 +178,16 @@ class TraceGenerator:
         """
         messages = self._build_messages(system_prompt, user_message, image)
 
-        # Apply Qwen chat template — always disable thinking for teacher
-        # (we want concise expert traces, not thinking-mode verbosity)
+        # Apply Qwen chat template with thinking mode enabled (Qwen3-VL-Thinking)
         try:
             text = self._processor.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,  # Qwen3 specific
+                enable_thinking=True,   # Qwen3 thinking mode
             )
         except TypeError:
-            # Fallback for models without enable_thinking
+            # Fallback for models without enable_thinking param
             text = self._processor.apply_chat_template(
                 messages,
                 tokenize=False,
@@ -215,14 +218,25 @@ class TraceGenerator:
 
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        with torch.no_grad():
-            output_ids = self._model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=(self.temperature > 0),
-                temperature=self.temperature if self.temperature > 0 else 1.0,
-                pad_token_id=self._processor.tokenizer.eos_token_id,
-            )
+        # Thinking mode generation params per Qwen3 official docs:
+        # temperature=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
+        generate_kwargs = dict(
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=self.temperature,   # 1.0 for thinking mode
+            top_p=0.95,
+            top_k=20,
+            pad_token_id=self._processor.tokenizer.eos_token_id,
+        )
+        # presence_penalty supported in newer transformers
+        try:
+            generate_kwargs["presence_penalty"] = 1.5
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, **generate_kwargs)
+        except TypeError:
+            generate_kwargs.pop("presence_penalty", None)
+            with torch.no_grad():
+                output_ids = self._model.generate(**inputs, **generate_kwargs)
 
         input_len = inputs["input_ids"].shape[1]
         new_tokens = output_ids[0][input_len:]
@@ -394,8 +408,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate PRISM expert traces")
     parser.add_argument(
         "--teacher",
-        default="Qwen/Qwen3-VL-30B-A3B",
-        help="Teacher VL model HF ID",
+        default="Qwen/Qwen3-VL-30B-A3B-Thinking",
+        help="Teacher VL model HF ID (must be >14B)",
     )
     parser.add_argument(
         "--domain",
