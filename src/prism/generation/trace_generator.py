@@ -872,8 +872,13 @@ class VLLMServerGenerator:
                             extra_body={
                                 "top_k": 20,
                                 "presence_penalty": 1.5,
-                                # Tell vLLM to use thinking mode for Qwen3
-                                "chat_template_kwargs": {"enable_thinking": True},
+                                # Disable thinking: Qwen3 inserts <think>\n</think>\n\n
+                                # which closes the think block immediately, sending the
+                                # model straight to its answer with no thinking narration.
+                                # enable_thinking=True consumed all 4096 tokens on
+                                # "Here's a thinking process..." meta-commentary instead
+                                # of actual math.
+                                "chat_template_kwargs": {"enable_thinking": False},
                             },
                         )
                         text = self._extract_content(resp.choices[0])

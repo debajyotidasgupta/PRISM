@@ -57,7 +57,7 @@ async def test():
         ],
         max_tokens=512,
         temperature=0.1,
-        extra_body={'chat_template_kwargs': {'enable_thinking': True}},
+        extra_body={'chat_template_kwargs': {'enable_thinking': False}},
     )
     msg = resp.choices[0].message
     has_rc = hasattr(msg, 'reasoning_content') and msg.reasoning_content is not None
