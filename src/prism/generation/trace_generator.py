@@ -750,11 +750,13 @@ class VLLMServerGenerator:
         server_url: str = "http://localhost:8000",
         max_new_tokens: int = 2048,
         concurrency: int = 512,
+        negative_fraction: float = 0.3,
     ):
         self.teacher_model_name = teacher_model_name
         self.server_url = server_url.rstrip("/")
         self.max_new_tokens = max_new_tokens
         self.concurrency = concurrency
+        self.negative_fraction = negative_fraction  # fraction of problems run free-solve
         self._model_id = None
         self._tokenizer = None
         self._loaded = False
@@ -784,70 +786,141 @@ class VLLMServerGenerator:
         self._loaded = True
         return self
 
-    def _format_prompt(self, system: str, user: str) -> str:
-        """Apply Qwen3.5 chat template with thinking mode; return raw text."""
-        messages = [
+    def _make_messages(self, system: str, user: str) -> list[dict]:
+        """Return OpenAI-format message list for chat completions."""
+        return [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
-        try:
-            return self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            )
-        except TypeError:
-            return self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
 
-    async def _gather_completions(self, prompts: list[str]) -> list[str]:
-        """Fire all prompts concurrently; return completions in original order."""
+    @staticmethod
+    def _extract_content(resp_choice) -> str:
+        """
+        Extract clean answer text from a chat completion choice.
+
+        With Qwen3 thinking models on vLLM:
+          - resp.choices[0].message.content  → answer after </think>  (what we want)
+          - resp.choices[0].message.reasoning_content → thinking chain (discard)
+
+        If reasoning_content is not supported by this vLLM version, fall back to
+        splitting on </think> in content.
+        """
+        msg = resp_choice.message
+        # Preferred: vLLM ≥0.6 exposes reasoning_content separately
+        rc = getattr(msg, "reasoning_content", None)
+        if rc is not None:
+            # reasoning_content present → content is already clean
+            return (msg.content or "").strip()
+
+        # Fallback: thinking chain is inlined with </think> separator
+        text = (msg.content or "").strip()
+        if "</think>" in text:
+            return text.split("</think>", 1)[1].strip()
+
+        # Last resort: strip leading meta-commentary heuristically
+        # (model narrated thinking without tags — extract after first blank line + header)
+        import re as _re
+        # Common patterns that end thinking and begin actual answer
+        for anchor in [
+            r"\n\*\*(?:Reformulation|Solution|Expert Solution|Phase [123]|Final Answer)\*\*",
+            r"\n---+\n",
+            r"\n\*\*(?:Step 1|1\.)\s+[A-Z][^*\n]{3,}\*\*\n",  # e.g. **Step 1: Setup**
+        ]:
+            m = _re.search(anchor, text)
+            if m and m.start() > 200:   # thinking chain is >200 chars before this
+                return text[m.start():].strip()
+
+        return text
+
+    async def _gather_completions(
+        self, message_batches: list[list[dict]], label: str = "", max_tokens: int = None
+    ) -> list[str]:
+        """
+        Fire all chat-completion requests concurrently; return answers in order.
+
+        Uses chat completions API (not raw completions) so that Qwen3 thinking
+        content is routed to reasoning_content / split on </think>, and
+        resp.choices[0].message.content contains only the clean answer.
+        """
         import asyncio
         from openai import AsyncOpenAI
+
+        phase_max_tokens = max_tokens if max_tokens is not None else self.max_new_tokens
 
         client = AsyncOpenAI(
             base_url=f"{self.server_url}/v1",
             api_key="dummy",
-            timeout=900.0,          # 15-min ceiling; long traces need time
+            timeout=10800.0,
             max_retries=0,
         )
         sem = asyncio.Semaphore(self.concurrency)
+        total = len(message_batches)
+        done_count = 0
+        lock = asyncio.Lock()
 
-        async def one(prompt: str, idx: int) -> tuple[int, str]:
+        async def one(messages: list[dict], idx: int) -> tuple[int, str]:
+            nonlocal done_count
             async with sem:
                 for attempt in range(3):
                     try:
-                        resp = await client.completions.create(
+                        resp = await client.chat.completions.create(
                             model=self._model_id,
-                            prompt=prompt,
-                            max_tokens=self.max_new_tokens,
+                            messages=messages,
+                            max_tokens=phase_max_tokens,
                             temperature=1.0,
                             top_p=0.95,
-                            extra_body={"top_k": 20, "presence_penalty": 1.5},
+                            extra_body={
+                                "top_k": 20,
+                                "presence_penalty": 1.5,
+                                # Tell vLLM to use thinking mode for Qwen3
+                                "chat_template_kwargs": {"enable_thinking": True},
+                            },
                         )
-                        return idx, resp.choices[0].text.strip()
+                        text = self._extract_content(resp.choices[0])
+                        finish = resp.choices[0].finish_reason
+                        async with lock:
+                            done_count += 1
+                            if done_count % max(1, total // 10) == 0 or done_count == total:
+                                pct = 100 * done_count / total
+                                logger.info(
+                                    f"  [{label}] {done_count}/{total} ({pct:.0f}%) "
+                                    f"— last finish_reason={finish}"
+                                )
+                        return idx, text
                     except Exception as e:
+                        err_str = str(e)
                         if attempt == 2:
                             logger.warning(f"Request {idx} failed after 3 attempts: {e}")
                             return idx, ""
+                        # Context overflow: truncate last user message content
+                        if "maximum context length" in err_str or "input_tokens" in err_str:
+                            msgs = list(messages)
+                            if msgs and msgs[-1]["role"] == "user":
+                                cur = msgs[-1]["content"]
+                                msgs[-1] = {**msgs[-1], "content": cur[:int(len(cur)*0.8)]}
+                                messages = msgs
+                                logger.warning(
+                                    f"Request {idx}: context overflow (attempt {attempt}), "
+                                    f"truncating user prompt"
+                                )
+                                continue
                         await asyncio.sleep(2 ** attempt)
                 return idx, ""
 
-        results = await asyncio.gather(*[one(p, i) for i, p in enumerate(prompts)])
+        results = await asyncio.gather(*[one(m, i) for i, m in enumerate(message_batches)])
         results.sort(key=lambda x: x[0])
         return [text for _, text in results]
 
-    def _run_phase(self, prompts: list[str], label: str) -> list[str]:
+    def _run_phase(self, message_batches: list[list[dict]], label: str, max_tokens: int = None) -> list[str]:
         """Synchronous wrapper: runs async gather in a fresh event loop."""
         import asyncio
-        logger.info(f"[Server→{self.server_url}] {label}: {len(prompts)} concurrent requests")
+        mt = max_tokens if max_tokens is not None else self.max_new_tokens
+        logger.info(f"[Server→{self.server_url}] {label}: {len(message_batches)} concurrent requests")
         loop = asyncio.new_event_loop()
         try:
-            return loop.run_until_complete(self._gather_completions(prompts))
+            return loop.run_until_complete(
+                self._gather_completions(message_batches, label=label, max_tokens=mt)
+            )
         finally:
             loop.close()
 
@@ -888,23 +961,46 @@ class VLLMServerGenerator:
 
         N = len(problems)
 
-        # ── Pass 1: Reformulate ───────────────────────────────────────────
+        # ── Assign free-solve flag per problem ────────────────────────────
+        # free_solve=True → no reference answer given → model attempts independently
+        # → creates natural negative examples when model is wrong on hard problems
+        import random as _random
+        rng = _random.Random(42)
+        is_free = [rng.random() < self.negative_fraction for _ in range(N)]
+        n_free = sum(is_free)
+        n_guided = N - n_free
+        logger.info(
+            f"Phase 1 split: {n_guided} guided (reference provided) + "
+            f"{n_free} free-solve (no reference → potential negatives)"
+        )
+
+        # ── Pass 1: Reformulate (guided) or Free-Solve (no reference) ────
+        # Pass message lists directly — chat completions API separates thinking
+        # from answer, so resp.choices[0].message.content is clean math only.
         p1 = [
-            self._format_prompt(
-                get_phase_system_prompt(domain, phase=0),
+            self._make_messages(
+                get_phase_system_prompt(domain, phase=0, free_solve=is_free[i]),
                 get_phase_user_prompt(
                     problem_texts[i], phase=0, domain=domain,
                     reference_solution=reference_solutions[i],
                     ground_truth=ground_truths[i],
+                    free_solve=is_free[i],
                 ),
             )
             for i in range(N)
         ]
-        solve_traces = self._run_phase(p1, "Pass 1 (Reformulate)")
+        # Phase 1: full solution — up to max_new_tokens
+        # Phase 2: CORRECT/WRONG verdict + 4 sentences — 512 tokens is plenty
+        # Phase 3: polished solution — 2048 tokens
+        P1_TOKENS = self.max_new_tokens          # e.g. 4096
+        P2_TOKENS = min(512, self.max_new_tokens)
+        P3_TOKENS = min(2048, self.max_new_tokens)
+
+        solve_traces = self._run_phase(p1, "Pass 1 (Reformulate/FreeSolve)", max_tokens=P1_TOKENS)
 
         # ── Pass 2: Verify ────────────────────────────────────────────────
         p2 = [
-            self._format_prompt(
+            self._make_messages(
                 get_phase_system_prompt(verify_domain, phase=1),
                 get_phase_user_prompt(
                     problem_texts[i], phase=1, domain=verify_domain,
@@ -914,11 +1010,11 @@ class VLLMServerGenerator:
             )
             for i in range(N)
         ]
-        verify_traces = self._run_phase(p2, "Pass 2 (Verify)")
+        verify_traces = self._run_phase(p2, "Pass 2 (Verify)", max_tokens=P2_TOKENS)
 
         # ── Pass 3: Correct ───────────────────────────────────────────────
         p3 = [
-            self._format_prompt(
+            self._make_messages(
                 get_phase_system_prompt(domain, phase=2),
                 get_phase_user_prompt(
                     problem_texts[i], phase=2, domain=domain,
@@ -929,7 +1025,7 @@ class VLLMServerGenerator:
             )
             for i in range(N)
         ]
-        correct_traces = self._run_phase(p3, "Pass 3 (Correct)")
+        correct_traces = self._run_phase(p3, "Pass 3 (Correct)", max_tokens=P3_TOKENS)
 
         # ── Assemble and write ────────────────────────────────────────────
         with open(output_path, "w", encoding="utf-8") as f:
@@ -964,14 +1060,34 @@ class VLLMServerGenerator:
                     solve_correct=solve_correct,
                     correct_correct=correct_correct,
                     total_tokens=total_tokens,
+                    free_solve=is_free[i],
                 )
                 if trace.is_valid(max_tokens_per_trace):
                     f.write(trace.to_jsonl() + "\n")
                     stats["kept"] += 1
 
+        n_free_kept = sum(
+            1 for t in _iter_jsonl(output_path) if t.get("free_solve") and not t.get("solve_correct")
+        ) if output_path.exists() else 0
         stats["pass_rate"] = stats["kept"] / max(stats["total"], 1)
+        stats["negative_examples"] = n_free_kept
         logger.info(f"[Server] Generation complete [{domain}]: {stats}")
         return stats
+
+
+def _iter_jsonl(path):
+    """Yield parsed dicts from a JSONL file (best-effort, skips bad lines)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError:
+                        pass
+    except FileNotFoundError:
+        return
 
 
 def make_generator(
@@ -981,6 +1097,7 @@ def make_generator(
     server_url: str = None,
     max_new_tokens: int = 1024,
     temperature: float = 1.0,
+    **kwargs,
 ):
     """
     Factory: returns the best available generator.
@@ -1004,6 +1121,7 @@ def make_generator(
             teacher_model_name=teacher_model_name,
             server_url=server_url,
             max_new_tokens=max_new_tokens,
+            negative_fraction=kwargs.get("negative_fraction", 0.3),
         ).load()
 
     if use_vllm:
@@ -1075,6 +1193,17 @@ def main():
             "Start servers with:  bash scripts/start_vllm_servers.sh"
         ),
     )
+    parser.add_argument(
+        "--negative-fraction",
+        type=float,
+        default=0.3,
+        help=(
+            "Fraction of problems solved without the reference answer (free-solve mode). "
+            "These create natural negative examples: Phase 1 may be wrong → "
+            "Phase 2 catches it → Phase 3 corrects. "
+            "Default 0.3 = 30%% free-solve, 70%% guided."
+        ),
+    )
     args = parser.parse_args()
 
     import os
@@ -1109,6 +1238,7 @@ def main():
         server_url=args.server_url,
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
+        negative_fraction=args.negative_fraction,
     )
 
     suffix = f"_cv_{args.cross_verify_domain}" if args.cross_verify_domain else ""
