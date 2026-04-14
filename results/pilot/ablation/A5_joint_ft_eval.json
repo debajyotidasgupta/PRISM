@@ -1,0 +1,34 @@
+{
+  "ablation": "A5_joint_ft",
+  "flags": {
+    "joint_finetuned": true,
+    "crossphase": true,
+    "crossmix": true,
+    "agg_mode": "mean",
+    "alpha": 1.0,
+    "norm_stabilize": true
+  },
+  "overall": 0.016,
+  "domain": {
+    "algebra": 0.04,
+    "geometry": 0.0,
+    "combinatorics": 0.04,
+    "number_theory": 0.0,
+    "miscellaneous": 0.0
+  },
+  "correct": {
+    "algebra": 1,
+    "geometry": 0,
+    "combinatorics": 1,
+    "number_theory": 0,
+    "miscellaneous": 0
+  },
+  "total": {
+    "algebra": 25,
+    "geometry": 25,
+    "combinatorics": 25,
+    "number_theory": 25,
+    "miscellaneous": 25
+  },
+  "n_total": 125
+}

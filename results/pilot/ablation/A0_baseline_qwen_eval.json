@@ -1,0 +1,30 @@
+{
+  "ablation": "A0_baseline_qwen",
+  "flags": {
+    "baseline": true,
+    "max_new_tokens": 256
+  },
+  "overall": 0.008,
+  "domain": {
+    "algebra": 0.0,
+    "geometry": 0.04,
+    "combinatorics": 0.0,
+    "number_theory": 0.0,
+    "miscellaneous": 0.0
+  },
+  "correct": {
+    "algebra": 0,
+    "geometry": 1,
+    "combinatorics": 0,
+    "number_theory": 0,
+    "miscellaneous": 0
+  },
+  "total": {
+    "algebra": 25,
+    "geometry": 25,
+    "combinatorics": 25,
+    "number_theory": 25,
+    "miscellaneous": 25
+  },
+  "n_total": 125
+}

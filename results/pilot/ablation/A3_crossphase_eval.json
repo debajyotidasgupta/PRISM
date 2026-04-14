@@ -1,0 +1,33 @@
+{
+  "ablation": "A3_crossphase",
+  "flags": {
+    "uniform_routing": false,
+    "hard_routing": false,
+    "crossphase": true,
+    "crossmix": false,
+    "agg_mode": "last"
+  },
+  "overall": 0.0,
+  "domain": {
+    "algebra": 0.0,
+    "geometry": 0.0,
+    "combinatorics": 0.0,
+    "number_theory": 0.0,
+    "miscellaneous": 0.0
+  },
+  "correct": {
+    "algebra": 0,
+    "geometry": 0,
+    "combinatorics": 0,
+    "number_theory": 0,
+    "miscellaneous": 0
+  },
+  "total": {
+    "algebra": 25,
+    "geometry": 25,
+    "combinatorics": 25,
+    "number_theory": 25,
+    "miscellaneous": 25
+  },
+  "n_total": 125
+}

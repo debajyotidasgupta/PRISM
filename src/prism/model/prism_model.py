@@ -66,6 +66,7 @@ from transformers import PreTrainedModel, AutoModelForCausalLM, AutoProcessor
 from prism.model.config import PRISMConfig
 from prism.model.expert_block import ExpertBlock
 from prism.model.cross_mix import CrossMixModule
+from prism.model.cross_phase import CrossPhaseModule
 from prism.model.router import DomainRouter
 
 logger = logging.getLogger(__name__)
@@ -139,16 +140,28 @@ class PRISMModel(PreTrainedModel):
             for _ in range(config.n_phases)
         ])
 
+        # CrossPhase module: per-domain temporal attention across phases
+        # Applied BEFORE each non-first phase's expert blocks run
+        # Lets verify/correct experts attend to solve/verify phase outputs
+        self.cross_phase = CrossPhaseModule(
+            hidden_dim=config.hidden_dim,
+            n_domains=config.n_domains,
+            n_heads=getattr(config, "crossphase_n_heads", 2),
+            head_dim=getattr(config, "crossphase_head_dim", 32),
+        )
+
         # Ablation flags (set externally for ablation experiments)
         self._use_hard_routing = False
         self._disable_crossmix = False
+        self._disable_crossphase = False
+        self._use_uniform_routing = False  # ablation: ignore router, use 1/N weights
 
     def _load_backbone(self, device=None):
         """Load backbone from /tmp or HF Hub."""
         from prism.model.backbone import load_backbone, freeze_backbone, get_insertion_layer
 
         model_name = self.config.backbone_name
-        backbone_model, processor = load_backbone(model_name, torch_dtype=torch.float16)
+        backbone_model, processor = load_backbone(model_name, torch_dtype=torch.bfloat16)
         freeze_backbone(backbone_model)
 
         if device is not None:
@@ -170,7 +183,14 @@ class PRISMModel(PreTrainedModel):
                 )
                 self.config.hidden_dim = actual_dim
 
-        logger.info(f"Backbone loaded. Insertion layer: {self._insert_layer}")
+        # Cast PRISM modules to match backbone dtype (bfloat16)
+        backbone_dtype = next(backbone_model.parameters()).dtype
+        self.router.to(dtype=backbone_dtype)
+        self.expert_blocks.to(dtype=backbone_dtype)
+        self.cross_mix.to(dtype=backbone_dtype)
+        self.cross_phase.to(dtype=backbone_dtype)
+
+        logger.info(f"Backbone loaded (dtype={backbone_dtype}). Insertion layer: {self._insert_layer}")
         return self
 
     def _get_backbone_layers(self):
@@ -206,51 +226,103 @@ class PRISMModel(PreTrainedModel):
         # phase_weights: [B, n_phases, n_domains] — different weights per phase
         phase_weights, phase_logits = self.router(h_K, attention_mask, phase_idx=None)
 
-        # ─── Step 3: Expert blocks + cross-domain mixing ─────────────────────
+        # ─── Step 3: Expert blocks + cross-domain + cross-phase mixing ──────────
         # Each domain maintains its own state across phases.
-        # CrossMix allows all domains to exchange information at each level.
-        # Phase routing weights determine how domain outputs are aggregated.
+        # CrossMix (within-phase): all domains exchange info at each phase level.
+        # CrossPhase (across-phases): each domain can attend to its own prior states.
+        # Phase routing weights are applied at EACH phase (not just the last).
 
         # Initialize: all domains start from h_K
         domain_states = [h_K.clone() for _ in range(self.config.n_domains)]
+        phase_history = []    # stores domain state lists after each phase's CrossMix
+        phase_aggregates = [] # routing-weighted aggregate per phase
 
         for phase_idx in range(self.config.n_phases):
-            # Get routing weights for this phase: [B, n_domains]
-            w_phase = phase_weights[:, phase_idx, :]  # [B, n_domains]
+            # Routing weights for THIS phase: [B, n_domains]
+            w_phase = phase_weights[:, phase_idx, :]
+
+            # Uniform-routing ablation: ignore router, give equal weight to all
+            if self._use_uniform_routing:
+                w_phase = torch.full_like(w_phase, 1.0 / self.config.n_domains)
+
+            # Cross-phase: let each domain attend to its own prior-phase states
+            # Applied BEFORE running experts (gives experts temporal context)
+            if phase_idx > 0 and not self._disable_crossphase:
+                domain_states = self.cross_phase(domain_states, phase_history, attention_mask)
 
             # Run ALL domain experts for this phase
-            # Each expert receives its domain's state from previous phase
             phase_outputs = [
                 self.expert_blocks[phase_idx][d](domain_states[d], attention_mask)
                 for d in range(self.config.n_domains)
             ]
 
-            # Cross-domain mixing: every domain consults all others
-            # This is where e.g. the verify algebra expert can query combinatorics
+            # CrossMix: every domain consults all others within this phase
             if not self._disable_crossmix:
                 mixed_outputs = self.cross_mix[phase_idx](phase_outputs, attention_mask)
             else:
                 mixed_outputs = phase_outputs
 
-            # Update domain states: each domain's state is its mixed output
-            # (maintains separate state per domain across phases)
+            # Persist domain states for next phase (and cross-phase history)
             domain_states = mixed_outputs
+            phase_history.append(list(mixed_outputs))  # snapshot after this phase
 
-        # ─── Step 4: Final aggregation ────────────────────────────────────────
-        # Use the last phase's routing weights to aggregate final domain outputs.
-        # The last phase (Correct) routing determines the final answer generation.
-        final_weights = phase_weights[:, -1, :]  # [B, n_domains]
+            # ── Compute routing-weighted aggregate for this phase ─────────────
+            # FIX: w_phase is NOW applied at every phase, not just the last
+            if self._use_hard_routing:
+                hard_idx = w_phase.argmax(dim=-1)  # [B]
+                w_eff = F.one_hot(hard_idx, self.config.n_domains).to(dtype=w_phase.dtype)
+            else:
+                w_eff = w_phase
 
-        if self._use_hard_routing:
-            # Ablation A8: hard routing (argmax) — collapses to one domain
-            hard_idx = final_weights.argmax(dim=-1)  # [B]
-            hard_one_hot = F.one_hot(hard_idx, self.config.n_domains).float()
-            final_weights = hard_one_hot
+            w = w_eff.unsqueeze(-1).unsqueeze(-1)            # [B, N, 1, 1]
+            stacked = torch.stack(mixed_outputs, dim=1)       # [B, N, T, D]
+            phase_agg = (w * stacked).sum(dim=1)              # [B, T, D]
+            phase_aggregates.append(phase_agg)
 
-        # Weighted sum: [B, n_domains, 1, 1] × [B, n_domains, T, D]
-        w = final_weights.unsqueeze(-1).unsqueeze(-1)       # [B, N, 1, 1]
-        stacked = torch.stack(domain_states, dim=1)          # [B, N, T, D]
-        h_K_prime = (w * stacked).sum(dim=1)                 # [B, T, D]
+        # ─── Step 4: Final aggregation across all phases ──────────────────────
+        # Combine per-phase aggregates. Each phase's contribution is gated by
+        # its own routing weights (already applied above), so h_K_prime reflects
+        # solve, verify, AND correct phase routing decisions — not just the last.
+        agg_mode = getattr(self.config, "phase_aggregate_mode", "mean")
+        if agg_mode == "last":
+            h_K_prime = phase_aggregates[-1]
+        elif agg_mode == "mean":
+            h_K_prime = torch.stack(phase_aggregates, dim=0).mean(dim=0)   # [B, T, D]
+        else:
+            # Fallback: mean
+            h_K_prime = torch.stack(phase_aggregates, dim=0).mean(dim=0)
+
+        # ─── Residual alpha blending ──────────────────────────────────────────
+        # Expert blocks trained on limited data produce partially random-direction
+        # h_K_prime.  Layers K+1..end of the frozen backbone were pre-trained on
+        # h_K, so a differently-directed replacement causes degenerate generation.
+        #
+        # Fix: blend h_K_prime with the original h_K using a scalar alpha:
+        #   h_K_prime_final = h_K + alpha * (h_K_prime - h_K)
+        #                   = (1-alpha)*h_K + alpha*h_K_prime
+        #
+        # Interpretation: expert blocks contribute CORRECTIONS on top of h_K.
+        #   alpha=0.0 → pure backbone (exact baseline, 0 expert influence)
+        #   alpha=0.2 → 80% backbone + 20% expert (safe for undertrained experts)
+        #   alpha=1.0 → full expert output (correct after joint end-to-end training)
+        #
+        # During joint fine-tuning (A5) training drives alpha=1.0 behavior since
+        # the full pipeline is optimized e2e and expert norms converge naturally.
+        # _residual_alpha is overridden to 1.0 there (or _disable_residual_blend=True).
+        #
+        # Separate norm stabilization on top ensures amplitude stays in-distribution
+        # regardless of alpha (belt-and-suspenders).
+        _residual_alpha = getattr(self, "_residual_alpha", 1.0)
+        if _residual_alpha < 1.0:
+            h_K_prime = h_K + _residual_alpha * (h_K_prime - h_K)
+
+        # Norm stabilization: after blending, rescale to h_K's per-position norm.
+        # Even at alpha=0.2 the blend can be slightly off in amplitude.
+        if not getattr(self, "_disable_norm_stabilize", False):
+            with torch.no_grad():
+                target_norm = h_K.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            current_norm = h_K_prime.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            h_K_prime = h_K_prime * (target_norm / current_norm)
 
         # ─── Step 5: Backbone → logits ────────────────────────────────────────
         logits = self._backbone_forward_from_K(h_K_prime, attention_mask)
@@ -305,58 +377,64 @@ class PRISMModel(PreTrainedModel):
         return out
 
     def _backbone_forward_to_K(self, input_ids, attention_mask, pixel_values, image_grid_thw):
-        model = self.backbone
-        device = input_ids.device
+        """
+        Run backbone from embedding to layer K, return hidden state at K.
 
-        inputs_embeds = model.model.embed_tokens(input_ids)
+        Uses a forward hook to intercept the output of layer K, then lets the
+        full model forward run (in no_grad since backbone is frozen). This avoids
+        manually reproducing Qwen3.5's internal position_id/mask/RoPE logic.
+        """
+        text_model = self.backbone.model  # Qwen3_5TextModel (has .layers, .embed_tokens, .norm)
+        captured = {}
 
-        if pixel_values is not None and hasattr(model, "visual"):
-            try:
-                image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
-                if hasattr(model, "_merge_input_ids_with_image_features"):
-                    inputs_embeds = model._merge_input_ids_with_image_features(
-                        inputs_embeds, image_embeds, input_ids
-                    )
-            except Exception as e:
-                logger.warning(f"Vision encoding skipped: {e}")
+        def _capture_hook(module, inp, output):
+            # Decoder layer returns a tensor directly (not a tuple in Qwen3.5)
+            h = output[0] if isinstance(output, (tuple, list)) else output
+            captured["h_K"] = h.detach().clone()  # detach: backbone is frozen, no grad needed here
 
-        hidden_states = inputs_embeds
-        B, T, D = hidden_states.shape
-        position_ids = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+        hook = text_model.layers[self._insert_layer].register_forward_hook(_capture_hook)
+        try:
+            with torch.no_grad():
+                text_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        finally:
+            hook.remove()
 
-        layers = self._get_backbone_layers()
-        for i in range(self._insert_layer + 1):
-            layer_out = layers[i](
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                output_attentions=False,
-            )
-            hidden_states = layer_out[0]
-
-        self._position_ids = position_ids
-        return hidden_states
+        # Save input_ids for the second pass (from_K needs to re-run layers 0..K)
+        self._saved_input_ids = input_ids
+        return captured["h_K"]
 
     def _backbone_forward_from_K(self, h_K_prime, attention_mask):
-        model = self.backbone
-        hidden_states = h_K_prime
-        position_ids = self._position_ids
+        """
+        Run backbone from layer K+1 to end, starting from h_K_prime.
 
-        layers = self._get_backbone_layers()
-        for i in range(self._insert_layer + 1, len(layers)):
-            layer_out = layers[i](
-                hidden_states,
+        Uses a forward hook on layer K to REPLACE its output with h_K_prime,
+        then lets layers K+1..end run normally. Gradients flow through h_K_prime
+        into the expert blocks (backbone K+1..end is frozen but participates in
+        the autograd graph so gradients reach h_K_prime).
+
+        IMPORTANT: Do NOT call this inside torch.no_grad() — it must participate
+        in the autograd graph so that loss.backward() reaches the expert blocks.
+        """
+        text_model = self.backbone.model
+
+        def _replace_hook(module, inp, output):
+            # Replace layer K output with the PRISM-processed hidden state
+            # h_K_prime.requires_grad=True (from trainable expert block) →
+            # autograd tracks operations in layers K+1..end w.r.t. h_K_prime
+            return h_K_prime
+
+        hook = text_model.layers[self._insert_layer].register_forward_hook(_replace_hook)
+        try:
+            out = text_model(
+                input_ids=self._saved_input_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
                 use_cache=False,
-                output_attentions=False,
             )
-            hidden_states = layer_out[0]
+            hidden_states = out.last_hidden_state
+        finally:
+            hook.remove()
 
-        hidden_states = model.model.norm(hidden_states)
-        logits = model.lm_head(hidden_states)
-        return logits
+        return self.backbone.lm_head(hidden_states)
 
     @torch.no_grad()
     def generate(
@@ -399,44 +477,63 @@ class PRISMModel(PreTrainedModel):
 
     # ─── Freezing helpers for staged training ─────────────────────────────────
 
-    def freeze_all_except_phase(self, phase_idx: int, domain_idx: int):
-        """Unfreeze only one (phase, domain) expert block. For per-expert training."""
+    def _freeze_all_prism(self):
+        """Freeze all PRISM modules (router, experts, crossmix, crossphase)."""
         for p in self.router.parameters():
             p.requires_grad_(False)
+        for phase_blocks in self.expert_blocks:
+            for block in phase_blocks:
+                for p in block.parameters():
+                    p.requires_grad_(False)
+        for cm in self.cross_mix:
+            for p in cm.parameters():
+                p.requires_grad_(False)
+        for p in self.cross_phase.parameters():
+            p.requires_grad_(False)
+
+    def freeze_all_except_phase(self, phase_idx: int, domain_idx: int):
+        """Unfreeze only one (phase, domain) expert block. For per-expert training."""
+        self._freeze_all_prism()
         for pi, phase_blocks in enumerate(self.expert_blocks):
             for di, block in enumerate(phase_blocks):
                 for p in block.parameters():
                     p.requires_grad_(pi == phase_idx and di == domain_idx)
-        for cm in self.cross_mix:
-            for p in cm.parameters():
-                p.requires_grad_(False)
 
     def freeze_all_except_router(self):
         """Unfreeze router only."""
+        self._freeze_all_prism()
+        for p in self.router.parameters():
+            p.requires_grad_(True)
+
+    def freeze_all_except_crossmix(self, level_idx: int):
+        """Unfreeze one cross-mix module."""
+        self._freeze_all_prism()
+        for i, cm in enumerate(self.cross_mix):
+            for p in cm.parameters():
+                p.requires_grad_(i == level_idx)
+
+    def freeze_all_except_crossphase(self):
+        """Unfreeze cross-phase module only."""
+        self._freeze_all_prism()
+        for p in self.cross_phase.parameters():
+            p.requires_grad_(True)
+
+    def unfreeze_all_prism(self):
+        """Unfreeze all PRISM modules for joint fine-tuning."""
         for p in self.router.parameters():
             p.requires_grad_(True)
         for phase_blocks in self.expert_blocks:
             for block in phase_blocks:
                 for p in block.parameters():
-                    p.requires_grad_(False)
+                    p.requires_grad_(True)
         for cm in self.cross_mix:
             for p in cm.parameters():
-                p.requires_grad_(False)
-
-    def freeze_all_except_crossmix(self, level_idx: int):
-        """Unfreeze one cross-mix module."""
-        for p in self.router.parameters():
-            p.requires_grad_(False)
-        for phase_blocks in self.expert_blocks:
-            for block in phase_blocks:
-                for p in block.parameters():
-                    p.requires_grad_(False)
-        for i, cm in enumerate(self.cross_mix):
-            for p in cm.parameters():
-                p.requires_grad_(i == level_idx)
+                p.requires_grad_(True)
+        for p in self.cross_phase.parameters():
+            p.requires_grad_(True)
 
     def get_prism_params(self) -> list:
-        """All trainable PRISM parameters."""
+        """All trainable PRISM parameters (excludes frozen backbone)."""
         params = []
         params.extend(self.router.parameters())
         for phase_blocks in self.expert_blocks:
@@ -444,6 +541,7 @@ class PRISMModel(PreTrainedModel):
                 params.extend(block.parameters())
         for cm in self.cross_mix:
             params.extend(cm.parameters())
+        params.extend(self.cross_phase.parameters())
         return params
 
     def count_prism_params(self) -> dict:

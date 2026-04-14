@@ -47,8 +47,12 @@ class PRISMConfig(PretrainedConfig):
         expert_head_dim: int = 64,
         expert_ffn_expansion: int = 4,
         crossmix_n_heads: int = 4,
+        crossphase_n_heads: int = 2,
+        crossphase_head_dim: int = 32,
+        phase_aggregate_mode: str = "mean",  # "mean" | "last" | "weighted"
         router_hidden_dim: int = 256,
         router_dropout: float = 0.1,
+        router_temperature: float = 1.0,     # <1 = sharper routing, >1 = softer
         domains: list = None,
         phases: list = None,
         **kwargs,
@@ -63,8 +67,12 @@ class PRISMConfig(PretrainedConfig):
         self.expert_head_dim = expert_head_dim
         self.expert_ffn_expansion = expert_ffn_expansion
         self.crossmix_n_heads = crossmix_n_heads
+        self.crossphase_n_heads = crossphase_n_heads
+        self.crossphase_head_dim = crossphase_head_dim
+        self.phase_aggregate_mode = phase_aggregate_mode
         self.router_hidden_dim = router_hidden_dim
         self.router_dropout = router_dropout
+        self.router_temperature = router_temperature
         self.domains = domains if domains is not None else DOMAIN_NAMES[:n_domains]
         self.phases = phases if phases is not None else PHASE_NAMES[:n_phases]
 

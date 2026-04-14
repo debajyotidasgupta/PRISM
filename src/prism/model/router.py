@@ -55,12 +55,14 @@ class DomainRouter(nn.Module):
         dropout: float = 0.1,
         misc_floor: float = 0.1,
         entropy_weight: float = 0.01,
+        temperature: float = 1.0,
     ):
         super().__init__()
         self.n_domains = n_domains
         self.n_phases = n_phases
         self.misc_floor = misc_floor
         self.entropy_weight = entropy_weight
+        self.temperature = temperature  # <1 = sharper routing (more decisive)
 
         # Global router: overall domain affinity for this problem
         self.global_router = nn.Sequential(
@@ -105,7 +107,7 @@ class DomainRouter(nn.Module):
         """
         # Mean pooling over real tokens
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()
+            mask = attention_mask.unsqueeze(-1).to(dtype=h.dtype)  # match h dtype (e.g. bfloat16)
             h_pooled = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
         else:
             h_pooled = h.mean(dim=1)  # [B, hidden_dim]
@@ -140,7 +142,7 @@ class DomainRouter(nn.Module):
         `misc_floor` weight so cross-domain tools are always accessible.
         Other domains are renormalized accordingly.
         """
-        raw_weights = F.softmax(logits, dim=-1)  # [B, n_domains]
+        raw_weights = F.softmax(logits / self.temperature, dim=-1)  # [B, n_domains]
 
         if self.misc_floor > 0 and self.n_domains >= 5:
             # Miscellaneous is always the last domain

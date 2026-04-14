@@ -1,0 +1,33 @@
+{
+  "ablation": "A1_uniform",
+  "flags": {
+    "uniform_routing": true,
+    "hard_routing": false,
+    "crossphase": false,
+    "crossmix": false,
+    "agg_mode": "last"
+  },
+  "overall": 0.008,
+  "domain": {
+    "algebra": 0.04,
+    "geometry": 0.0,
+    "combinatorics": 0.0,
+    "number_theory": 0.0,
+    "miscellaneous": 0.0
+  },
+  "correct": {
+    "algebra": 1,
+    "geometry": 0,
+    "combinatorics": 0,
+    "number_theory": 0,
+    "miscellaneous": 0
+  },
+  "total": {
+    "algebra": 25,
+    "geometry": 25,
+    "combinatorics": 25,
+    "number_theory": 25,
+    "miscellaneous": 25
+  },
+  "n_total": 125
+}
