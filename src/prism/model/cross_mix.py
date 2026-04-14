@@ -47,7 +47,6 @@ class CrossMixModule(nn.Module):
         self.n_domains = n_domains
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
         inner_dim = n_heads * head_dim
 
         # Per-domain projections
@@ -96,19 +95,15 @@ class CrossMixModule(nn.Module):
             q = self.q_projs[d](x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
 
             # Cross-attention: each position queries all N*T positions
-            attn = torch.matmul(q, keys.transpose(-2, -1)) * self.scale  # [B, H, T, N*T]
-
-            # Mask: attend only to real (non-pad) positions across all experts
+            # Build additive mask over the full N*T key sequence
+            attn_mask = None
             if attention_mask is not None:
-                # Replicate mask for all N expert sequences
                 full_mask = attention_mask.repeat(1, self.n_domains)  # [B, N*T]
-                full_mask = full_mask[:, None, None, :].float()
-                attn = attn + (1.0 - full_mask) * -1e9
+                attn_mask = (1.0 - full_mask[:, None, None, :].to(dtype=q.dtype)) * -1e4
 
-            attn = F.softmax(attn, dim=-1)
-            attn = self.dropout(attn)
-
-            out = torch.matmul(attn, vals)  # [B, H, T, Dh]
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, keys, vals, attn_mask=attn_mask, dropout_p=dropout_p)
+            # [B, H, T, Dh]
             out = out.transpose(1, 2).contiguous().view(B, T, H * Dh)
             out = self.out_projs[d](out)
 

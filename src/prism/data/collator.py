@@ -97,6 +97,76 @@ class PRISMDataCollator:
         return batch
 
 
+def tokenize_full_trace(
+    example: "TraceExample",
+    tokenizer,
+    max_length: int = 2048,
+) -> Dict[str, Any]:
+    """
+    Tokenize a TraceExample with ALL 3 phases concatenated.
+
+    Training format (must match eval prompt format exactly):
+        [BOS] problem \\n\\n solve_trace \\n\\n verify_trace \\n\\n correct_trace [EOS]
+
+    Phase budgets (enforced here — keeps traces concise and generation predictable):
+        solve:   up to 256 tokens  (key insight + non-trivial steps + \\boxed{})
+        verify:  up to 128 tokens  (CORRECT/WRONG + 1-4 sentences)
+        correct: up to 256 tokens  (final polished trace ending in \\boxed{})
+
+    Labels: -100 for problem+sep (not supervised), trace tokens supervised.
+    The model learns: given problem, generate the full 3-phase chain ending in \\boxed{ans}.
+    """
+    sep = tokenizer.encode("\n\n", add_special_tokens=False)
+    eos = [tokenizer.eos_token_id] if tokenizer.eos_token_id is not None else []
+
+    # Strict per-phase token budgets — sum ≈ 640 tokens, well within 2048
+    SOLVE_BUDGET   = 256   # ~5-15 lines of math
+    VERIFY_BUDGET  = 128   # CORRECT/WRONG + brief diagnosis
+    CORRECT_BUDGET = 256   # final trace, MUST end with \boxed{}
+
+    phase_total = SOLVE_BUDGET + VERIFY_BUDGET + CORRECT_BUDGET + len(sep) * 3 + len(eos)
+    problem_budget = max(128, max_length - phase_total)
+
+    problem_tokens = tokenizer.encode(
+        example.problem,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=problem_budget,
+    )
+    solve_tokens = tokenizer.encode(
+        example.solve_trace or "",
+        add_special_tokens=False,
+        truncation=True,
+        max_length=SOLVE_BUDGET,
+    )
+    verify_tokens = tokenizer.encode(
+        example.verify_trace or "",
+        add_special_tokens=False,
+        truncation=True,
+        max_length=VERIFY_BUDGET,
+    )
+    correct_tokens = tokenizer.encode(
+        example.correct_trace or "",
+        add_special_tokens=False,
+        truncation=True,
+        max_length=CORRECT_BUDGET,
+    )
+
+    # Sequence: problem \n\n solve \n\n verify \n\n correct EOS
+    prefix = problem_tokens + sep
+    trace_part = solve_tokens + sep + verify_tokens + sep + correct_tokens + eos
+    input_ids = prefix + trace_part
+
+    # Supervise only trace tokens (problem is context, not target)
+    labels = [-100] * len(prefix) + trace_part
+
+    return {
+        "input_ids": input_ids,
+        "labels": labels,
+        "attention_mask": [1] * len(input_ids),
+    }
+
+
 def tokenize_trace_example(
     example: "TraceExample",
     tokenizer,

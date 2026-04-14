@@ -121,13 +121,30 @@ class RouterTrainer:
             # Get backbone hidden states (frozen)
             h_K = self._get_hidden_states(input_ids, attention_mask)
 
-            # Router forward
+            # Router forward — all phases: logits shape [B, n_phases, n_domains]
             weights, logits = self.model.router(h_K, attention_mask)
 
-            # Loss: KL divergence from soft labels
             import torch.nn.functional as F
-            log_probs = F.log_softmax(logits, dim=-1)
-            loss = F.kl_div(log_probs, domain_labels, reduction="batchmean")
+            # KL divergence: train all phases to predict the same domain distribution
+            # logits: [B, n_phases, n_domains] — domain_labels: [B, n_domains]
+            # Average KL across phases for consistent training signal
+            kl_losses = []
+            for p in range(logits.shape[1]):
+                log_probs_p = F.log_softmax(logits[:, p, :], dim=-1)  # [B, n_domains]
+                kl_p = F.kl_div(log_probs_p, domain_labels, reduction="batchmean")
+                kl_losses.append(kl_p)
+            kl_loss = sum(kl_losses) / len(kl_losses)
+
+            # Cross-entropy loss on hard labels (sharper gradients for decisive routing)
+            hard_labels = domain_labels.argmax(dim=-1)  # [B]
+            ce_losses = []
+            for p in range(logits.shape[1]):
+                ce_p = F.cross_entropy(logits[:, p, :], hard_labels)
+                ce_losses.append(ce_p)
+            ce_loss = sum(ce_losses) / len(ce_losses)
+
+            # Combined: KL (soft alignment) + CE (sharp argmax)
+            loss = 0.5 * kl_loss + 0.5 * ce_loss
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -136,9 +153,10 @@ class RouterTrainer:
 
             total_loss += loss.item()
 
-            # Accuracy: argmax of prediction vs argmax of label
-            pred_domain = logits.argmax(dim=-1)
-            true_domain = domain_labels.argmax(dim=-1)
+            # Accuracy: argmax of phase-0 prediction vs argmax of label
+            # BUG FIX: use phase 0 only (not all phases) to avoid inflating accuracy by n_phases
+            pred_domain = logits[:, 0, :].argmax(dim=-1)   # [B] — phase 0 prediction
+            true_domain = domain_labels.argmax(dim=-1)      # [B]
             correct += (pred_domain == true_domain).sum().item()
             total += input_ids.size(0)
 

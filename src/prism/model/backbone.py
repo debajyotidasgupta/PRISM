@@ -73,6 +73,14 @@ def load_backbone(model_name: str, torch_dtype=torch.float16, device_map=None):
     if hf_token:
         kwargs["token"] = hf_token
 
+    # Use FlashAttention-2 when available (significant speedup for long sequences)
+    try:
+        import flash_attn  # noqa: F401
+        kwargs["attn_implementation"] = "flash_attention_2"
+        logger.info("FlashAttention-2 enabled for backbone inference")
+    except ImportError:
+        logger.info("flash_attn not found — using default attention (SDPA)")
+
     logger.info(f"Loading backbone: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
     processor = AutoProcessor.from_pretrained(

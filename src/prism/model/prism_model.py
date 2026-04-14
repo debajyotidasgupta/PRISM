@@ -441,21 +441,65 @@ class PRISMModel(PreTrainedModel):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 1536,
         temperature: float = 0.0,
         do_sample: bool = False,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         **kwargs,
     ) -> torch.Tensor:
-        """Single forward pass per token — no inference-time scaling."""
+        """
+        Autoregressive generation with PRISM expert blocks.
+
+        Full PRISM forward runs at every token step (no KV-cache — expert blocks
+        modify h_K at each step based on the full context).
+
+        Args:
+            max_new_tokens: Token budget. Default 1536 covers the full
+                solve→verify→correct chain (avg 520-1040 tokens in training).
+            temperature: Sampling temperature. 0 = greedy.
+            do_sample: Enable multinomial sampling (requires temperature > 0).
+            top_p: Nucleus sampling cutoff (applied before sampling).
+            repetition_penalty: > 1.0 penalises tokens already in context.
+        """
         generated = input_ids.clone()
         gen_mask = attention_mask.clone() if attention_mask is not None else None
 
-        for step in range(max_new_tokens):
-            out = self.forward(generated, attention_mask=gen_mask)
-            logits = out["logits"][:, -1, :]
+        # Collect EOS token ids once
+        eos_ids: set = set()
+        if hasattr(self.backbone, "config") and self.backbone.config.eos_token_id is not None:
+            raw_eos = self.backbone.config.eos_token_id
+            eos_ids = set(raw_eos if isinstance(raw_eos, list) else [raw_eos])
 
+        for _ in range(max_new_tokens):
+            out = self.forward(generated, attention_mask=gen_mask)
+            logits = out["logits"][:, -1, :].float()   # [B, vocab]  (float32 for sampling)
+
+            # ── Repetition penalty ────────────────────────────────────────────
+            if repetition_penalty != 1.0:
+                for b in range(generated.size(0)):
+                    for token_id in generated[b].unique():
+                        tid = token_id.item()
+                        if logits[b, tid] > 0:
+                            logits[b, tid] /= repetition_penalty
+                        else:
+                            logits[b, tid] *= repetition_penalty
+
+            # ── Sampling ──────────────────────────────────────────────────────
             if temperature > 0 and do_sample:
-                probs = torch.softmax(logits / temperature, dim=-1)
+                scaled = logits / temperature
+
+                # Top-p (nucleus) filtering
+                if top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(scaled, dim=-1, descending=True)
+                    cumprobs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                    # Remove tokens above nucleus threshold (shift right so the last kept token stays)
+                    remove = cumprobs - torch.softmax(sorted_logits, dim=-1) > top_p
+                    sorted_logits[remove] = float('-inf')
+                    # Scatter back to original ordering
+                    scaled.scatter_(-1, sorted_idx, sorted_logits)
+
+                probs = torch.softmax(scaled, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
             else:
                 next_token = logits.argmax(dim=-1, keepdim=True)
@@ -464,14 +508,9 @@ class PRISMModel(PreTrainedModel):
             if gen_mask is not None:
                 gen_mask = torch.cat([gen_mask, gen_mask.new_ones((gen_mask.size(0), 1))], dim=-1)
 
-            if hasattr(self.backbone, "config") and self.backbone.config.eos_token_id is not None:
-                eos = self.backbone.config.eos_token_id
-                if isinstance(eos, list):
-                    done = any(next_token.eq(e).all() for e in eos)
-                else:
-                    done = next_token.eq(eos).all()
-                if done:
-                    break
+            # EOS check
+            if eos_ids and next_token.item() in eos_ids:
+                break
 
         return generated
 

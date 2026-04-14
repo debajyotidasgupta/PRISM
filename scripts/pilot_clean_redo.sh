@@ -101,24 +101,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 from datasets import load_dataset
 from prism.generation.trace_generator import VLLMServerGenerator
 
+# Exact subject names from MATH-500 (case-sensitive, with spaces/ampersands)
+# Confirmed by: Counter(ex['subject'] for ex in ds)
+#   Algebra: 124, Intermediate Algebra: 97, Prealgebra: 82,
+#   Number Theory: 62, Precalculus: 56, Geometry: 41, Counting & Probability: 38
 DOMAIN_TO_SUBJECT = {
-    'algebra': ['algebra'],
-    'geometry': ['geometry'],
-    'combinatorics': ['counting_and_probability'],
-    'number_theory': ['number_theory'],
-    'miscellaneous': ['intermediate_algebra', 'prealgebra', 'precalculus'],
+    'algebra':       ['Algebra'],
+    'geometry':      ['Geometry'],
+    'combinatorics': ['Counting & Probability'],
+    'number_theory': ['Number Theory'],
+    'miscellaneous': ['Intermediate Algebra', 'Prealgebra', 'Precalculus'],
 }
 subjects = DOMAIN_TO_SUBJECT['$domain']
 
 ds = load_dataset('HuggingFaceH4/MATH-500', split='test', cache_dir='.cache/huggingface')
-problems_raw = [ex for ex in ds if ex.get('subject','').lower().replace(' ','_') in subjects]
-if not problems_raw:
-    # fallback: try direct match
-    problems_raw = [ex for ex in ds if any(s in ex.get('subject','').lower() for s in subjects)]
+problems_raw = [ex for ex in ds if ex.get('subject','') in subjects]
 import random; rng = random.Random(123)
 rng.shuffle(problems_raw)
+# Use all available if fewer than N_PILOT (geometry=41, combinatorics=38)
 problems_raw = problems_raw[:${N_PILOT}]
-logging.info(f'[$domain] {len(problems_raw)} problems (subjects={subjects})')
+logging.info(f'[$domain] {len(problems_raw)} problems available (subjects={subjects})')
 
 formatted = [
     {'problem': ex['problem'], 'solution': ex.get('solution',''),
@@ -160,8 +162,8 @@ echo ""
 echo "[$(date)] Validating regenerated traces (quality gate: <20% bad, ≥50 usable/domain)..."
 python -u -m prism.data.validate_traces \
     --dir "${PILOT_DIR}" \
-    --min-usable 50 \
-    --max-bad-rate 0.20 \
+    --min-usable 30 \
+    --max-bad-rate 0.15 \
     --verbose \
     2>&1 | tee "$LOG_DIR/trace_validation.log"
 

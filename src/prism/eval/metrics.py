@@ -28,10 +28,10 @@ def normalize_answer(answer: str) -> str:
 
     s = str(answer).strip()
 
-    # Extract from \\boxed{...}
-    boxed = re.search(r"\\boxed\{([^}]+)\}", s)
-    if boxed:
-        s = boxed.group(1).strip()
+    # Extract from \\boxed{...} (handles nested braces)
+    boxed = _extract_last_boxed(s)
+    if boxed is not None:
+        s = boxed
 
     # Remove LaTeX commands but keep content
     s = re.sub(r"\\dfrac\{([^}]*)\}\{([^}]*)\}", r"\1/\2", s)
@@ -76,15 +76,40 @@ def exact_match(predicted: str, ground_truth: str) -> bool:
     except (ValueError, ZeroDivisionError):
         pass
 
-    # Try float comparison with small tolerance
+    # Try float comparison with small tolerance (guard against huge expressions)
     try:
-        pred_float = float(eval(pred_norm.replace("^", "**")))
-        gt_float = float(eval(gt_norm.replace("^", "**")))
-        return abs(pred_float - gt_float) < 1e-6
+        if len(pred_norm) < 50 and len(gt_norm) < 50:
+            pred_float = float(eval(pred_norm.replace("^", "**")))
+            gt_float = float(eval(gt_norm.replace("^", "**")))
+            return abs(pred_float - gt_float) < 1e-6
     except Exception:
         pass
 
     return False
+
+
+def _extract_last_boxed(text: str) -> Optional[str]:
+    """Extract content of the LAST \\boxed{...}, correctly handling nested braces."""
+    results = []
+    i = 0
+    while i < len(text):
+        idx = text.find(r'\boxed{', i)
+        if idx == -1:
+            break
+        depth = 0
+        start = idx + len(r'\boxed{')
+        j = start
+        while j < len(text):
+            if text[j] == '{':
+                depth += 1
+            elif text[j] == '}':
+                if depth == 0:
+                    results.append(text[start:j])
+                    break
+                depth -= 1
+            j += 1
+        i = idx + 1
+    return results[-1].strip() if results else None
 
 
 def extract_answer_from_text(text: str) -> str:
@@ -92,10 +117,10 @@ def extract_answer_from_text(text: str) -> str:
     Extract the final answer from a model's generated text.
     Tries multiple patterns in order of confidence.
     """
-    # \\boxed{...} — highest confidence
-    boxed = re.search(r"\\boxed\{([^}]+)\}", text)
-    if boxed:
-        return boxed.group(1).strip()
+    # \\boxed{...} — highest confidence, handles nested braces correctly
+    boxed = _extract_last_boxed(text)
+    if boxed is not None:
+        return boxed
 
     # "The answer is X"
     pattern1 = re.search(

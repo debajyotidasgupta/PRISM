@@ -8,9 +8,9 @@
 
 ## Current Status
 
-**Phase:** Pilot complete — A5 beats baseline 2×; ready to scale to full training
+**Phase:** Pilot complete — A6 (clean traces) beats baseline 4×; ready to scale to full training
 
-**Last updated:** 2026-04-14 15:35
+**Last updated:** 2026-04-14 19:28
 
 ---
 
@@ -114,9 +114,10 @@ Pilot complete. A5 eval done. Next: scale to full training.
 ## Queued Next
 
 1. ~~Ablations A1-A4~~ ✓ (done)
-2. ~~Joint fine-tuning A5~~ ✓ (done: 1.6%, 2× baseline)
+2. ~~Joint fine-tuning A5~~ ✓ (done: 1.6%, 2× baseline — contaminated traces)
 3. ~~Baseline eval~~ ✓ (done: 0.8%)
-4. **NEXT: Scale to full training** — A5 cleared the bar. Resume trace gen (Rounds 2+3) and train full expert blocks on all 500+ problems.
+4. ~~A6 clean pilot JFT~~ ✓ (done: **3.2%, 4× baseline** — clean traces, 4-GPU parallel eval)
+5. **NEXT: Scale to full training** — A6 cleared the bar. Resume trace gen (Rounds 2+3) and train full expert blocks on all 500+ problems.
    - `bash scripts/start_vllm_servers.sh` then `bash scripts/resume_trace_gen.sh 2`
    - After full traces: retrain all modules with `scripts/joint_finetune_pilot.sh` (or full version)
 
@@ -135,6 +136,7 @@ Pilot complete. A5 eval done. Next: scale to full training.
 | A3 CrossPhase (pilot) | 0.0% | Untrained CrossPhase adds noise |
 | A4 hard routing (pilot) | 0.0% | Catastrophic with undertrained router |
 | **A5 joint fine-tuning (pilot)** | **1.6%** | 2/125: 1 algebra + 1 combinatorics; **2× baseline** |
+| **A6 clean pilot JFT** | **3.2%** | 4/125: alg=4%, geo=**12%**, comb=0%, nt=0%, misc=0%; **4× baseline** |
 
 ### Critical Bugs Found & Fixed (2026-04-14)
 

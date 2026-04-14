@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Start 4 vLLM OpenAI-compatible servers, one per GH200 GPU.
-# Each server is independent (tensor_parallel_size=1) on ports 8000-8003.
-# All trace generation jobs hit these servers via HTTP — no in-process model loading.
+# Start a single vLLM OpenAI-compatible server using all 4 GH200 GPUs (TP=4).
+# One server, tensor_parallel_size=4 — 4× the KV cache, better utilisation.
+# All trace generation jobs hit this server via HTTP on port 8000.
 #
 # Usage:
-#   bash scripts/start_vllm_servers.sh [MODEL_PATH] [BASE_PORT]
-#   bash scripts/start_vllm_servers.sh                              # defaults below
+#   bash scripts/start_vllm_servers.sh [MODEL_PATH] [PORT]
+#   bash scripts/start_vllm_servers.sh
 #   bash scripts/start_vllm_servers.sh /tmp/prism_models/Qwen--Qwen3.5-35B-A3B 8000
 
 set -eo pipefail
@@ -13,69 +13,57 @@ source "$(dirname "$0")/setup/env.sh" || true
 cd "${PRISM_ROOT}"
 
 MODEL_PATH="${1:-/tmp/prism_models/Qwen--Qwen3.5-35B-A3B}"
-BASE_PORT="${2:-8000}"
+PORT="${2:-8000}"
 LOG_DIR="${PRISM_LOG_DIR:-${PRISM_ROOT}/results/logs}"
 mkdir -p "${LOG_DIR}"
+LOGFILE="${LOG_DIR}/vllm_server.log"
 
 echo "======================================================"
-echo "Starting 4 vLLM servers"
-echo "Model   : ${MODEL_PATH}"
-echo "Ports   : ${BASE_PORT}-$((BASE_PORT+3))"
-echo "Started : $(date)"
+echo "Starting vLLM server (TP=4, all 4 GH200 GPUs)"
+echo "Model  : ${MODEL_PATH}"
+echo "Port   : ${PORT}"
+echo "Log    : ${LOGFILE}"
+echo "Started: $(date)"
 echo "======================================================"
 
-SERVER_PIDS=()
-for GPU in 0 1 2 3; do
-    PORT=$((BASE_PORT + GPU))
-    LOGFILE="${LOG_DIR}/vllm_server_gpu${GPU}.log"
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+nohup python -m vllm.entrypoints.openai.api_server \
+    --model "${MODEL_PATH}" \
+    --port "${PORT}" \
+    --host 0.0.0.0 \
+    --tensor-parallel-size 4 \
+    --max-model-len 8192 \
+    --enforce-eager \
+    --trust-remote-code \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.90 \
+    --limit-mm-per-prompt '{"image": 0, "video": 0}' \
+    --max-num-seqs 512 \
+    --disable-uvicorn-access-log \
+    > "${LOGFILE}" 2>&1 &
 
-    CUDA_VISIBLE_DEVICES=${GPU} \
-    TORCHDYNAMO_DISABLE=1 \
-    VLLM_ATTENTION_BACKEND=FLASHINFER \
-    VLLM_FLASH_ATTN_VERSION=2 \
-    nohup vllm serve "${MODEL_PATH}" \
-        --port "${PORT}" \
-        --host 0.0.0.0 \
-        --max-model-len 8192 \
-        --enforce-eager \
-        --no-enable-prefix-caching \
-        --gpu-memory-utilization 0.90 \
-        --limit-mm-per-prompt '{"image": 0, "video": 0}' \
-        --max-num-seqs 1024 \
-        --disable-uvicorn-access-log \
-        > "${LOGFILE}" 2>&1 &
+SERVER_PID=$!
+echo "Server PID: ${SERVER_PID}"
+echo "${SERVER_PID}" > /tmp/prism_vllm_server_pid.txt
 
-    SERVER_PIDS+=($!)
-    echo "  [GPU${GPU}] port ${PORT}  PID=${SERVER_PIDS[-1]}  log=${LOGFILE}"
+echo ""
+echo "Waiting for server to pass health check..."
+printf "  port ${PORT} "
+until curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; do
+    if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+        echo ""
+        echo "ERROR: server (PID ${SERVER_PID}) died during startup."
+        echo "       Check ${LOGFILE}"
+        exit 1
+    fi
+    printf "."
+    sleep 5
 done
-
-echo ""
-echo "Server PIDs: ${SERVER_PIDS[*]}"
-printf "%s\n" "${SERVER_PIDS[@]}" > /tmp/prism_vllm_server_pids.txt
-
-echo ""
-echo "Waiting for all 4 servers to pass health check..."
-for GPU in 0 1 2 3; do
-    PORT=$((BASE_PORT + GPU))
-    printf "  GPU%d (port %d) " "${GPU}" "${PORT}"
-    until curl -sf "http://localhost:${PORT}/health" > /dev/null 2>&1; do
-        # Bail out if the server process died
-        if ! kill -0 "${SERVER_PIDS[$GPU]}" 2>/dev/null; then
-            echo ""
-            echo "ERROR: server for GPU${GPU} (PID ${SERVER_PIDS[$GPU]}) died during startup."
-            echo "       Check ${LOG_DIR}/vllm_server_gpu${GPU}.log"
-            exit 1
-        fi
-        printf "."
-        sleep 5
-    done
-    echo " ready"
-done
+echo " ready"
 
 echo ""
 echo "======================================================"
-echo "All 4 vLLM servers healthy — ready for trace generation"
-echo "Ports: ${BASE_PORT} $((BASE_PORT+1)) $((BASE_PORT+2)) $((BASE_PORT+3))"
+echo "vLLM server healthy on port ${PORT}  (PID ${SERVER_PID})"
 echo ""
 echo "Next step:"
 echo "  bash scripts/run_trace_gen.sh 1    # Round 1 — primary traces"

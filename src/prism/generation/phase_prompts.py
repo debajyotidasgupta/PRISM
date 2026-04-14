@@ -64,66 +64,93 @@ DOMAIN_EXPERT_DESCRIPTIONS = {
 }
 
 PHASE_INSTRUCTIONS = {
-    0: {  # Reformulate → expert solve trace
+    0: {  # Reformulate → expert solve trace (guided: reference answer provided)
         "title": "Phase 1: Expert Reformulation",
         "instruction": (
             "You are given a math problem and its CORRECT solution. "
-            "Your task is NOT to solve the problem from scratch. "
-            "Instead, reformulate the provided solution as a structured, step-by-step "
-            "reasoning trace written in the voice of your domain expertise described above. "
-            "Reorganize, annotate, and explain each step using the specific methods and "
-            "vocabulary of your domain (e.g., an algebraist would highlight ring structure; "
-            "a geometer would name the circle theorem being applied; etc.). "
-            "Make the expert reasoning pathway explicit and clear. "
-            "End with the final answer enclosed in \\boxed{{...}}."
+            "Reformulate it as a MINIMAL expert reasoning trace in your domain voice.\n\n"
+            "STRICT RULES — violating any of these makes the trace unusable:\n"
+            "• HARD LIMIT: your entire response must fit in 150 words or fewer.\n"
+            "• ONE sentence for the key insight or strategy (name the theorem/identity).\n"
+            "• Show ONLY non-obvious steps. Skip trivial arithmetic and obvious algebra.\n"
+            "• Combine consecutive routine sub-steps into a single line.\n"
+            "• Zero prose padding. Zero problem restatement. Zero motivation for obvious moves.\n"
+            "• Your LAST line must be: \\boxed{{final_answer}}\n\n"
+            "Format:\n"
+            "[Key insight in one sentence.]\n"
+            "[Step 1 — only if non-trivial]\n"
+            "...\n"
+            "\\boxed{{answer}}"
+        ),
+        "output_tag": "phase1_solve",
+    },
+    "0_free": {  # Phase 1 free-solve: NO reference answer — model solves independently
+        "title": "Phase 1: Expert Free Solve",
+        "instruction": (
+            "You are given a math problem. Solve it using your domain expertise.\n\n"
+            "STRICT RULES — violating any of these makes the trace unusable:\n"
+            "• HARD LIMIT: your entire response must fit in 150 words or fewer.\n"
+            "• ONE sentence for the key insight or strategy.\n"
+            "• Show ONLY non-obvious steps. No arithmetic a reader can verify mentally.\n"
+            "• Zero prose padding. Zero restating the problem.\n"
+            "• Your LAST line must be: \\boxed{{your_answer}}\n\n"
+            "If uncertain, give your best mathematical attempt — never refuse or hedge."
         ),
         "output_tag": "phase1_solve",
     },
     1: {  # Verify the Phase 1 trace
         "title": "Phase 2: Expert Verification",
         "instruction": (
-            "You are given a math problem, its known correct answer, and an expert reasoning trace. "
-            "Your task is to VERIFY the reasoning trace — do NOT re-solve the problem. "
-            "Check each step for: mathematical correctness, valid domain-specific reasoning, "
-            "logical continuity, and correct arrival at the known answer. "
-            "Be specific: quote any step that is imprecise, skips justification, or is wrong, "
-            "and explain what is missing or incorrect. "
-            "If the trace is fully sound, confirm this explicitly and state what makes it valid. "
-            "Do NOT produce a corrected solution — only diagnose and report."
+            "You are given a math problem, its known correct answer, and a reasoning trace. "
+            "VERIFY the trace only — do NOT re-solve.\n\n"
+            "STRICT FORMAT (≤ 60 words total):\n"
+            "Line 1: exactly 'CORRECT' or 'WRONG' (one word, no punctuation after).\n"
+            "Lines 2-3: if CORRECT — one sentence on what makes it valid. "
+            "If WRONG — quote the first bad step and one sentence on why it fails.\n\n"
+            "Nothing else. No corrected solution."
         ),
         "output_tag": "phase2_verify",
     },
     2: {  # Correct / polish using Phase 1 + Phase 2
         "title": "Phase 3: Final Expert Solution",
         "instruction": (
-            "You are given a math problem, its known correct answer, an initial expert reasoning "
-            "trace (Phase 1), and a verification report (Phase 2). "
-            "Produce the FINAL, POLISHED expert solution. "
-            "If Phase 2 found errors or gaps: fix them precisely while keeping the expert "
-            "domain methodology intact. "
-            "If Phase 2 confirmed the trace was sound: reproduce it cleanly, improving clarity "
-            "and concision where possible. "
-            "Show all steps. The solution must reflect the domain expertise described above. "
-            "End with the final answer enclosed in \\boxed{{...}}."
+            "You are given a math problem, its correct answer, an initial expert trace, "
+            "and a verification report.\n\n"
+            "Produce the FINAL, MINIMAL expert solution.\n\n"
+            "STRICT RULES — violating any of these makes the output unusable:\n"
+            "• HARD LIMIT: your entire response must fit in 150 words or fewer.\n"
+            "• If Phase 2 found errors: fix only the error. Keep all valid steps.\n"
+            "• If Phase 2 confirmed soundness: copy the trace verbatim, remove any padding.\n"
+            "• Include ONLY steps with non-trivial mathematical content.\n"
+            "• Zero prose, zero padding, zero restating the problem.\n"
+            "• Your LAST line must be: \\boxed{{final_answer}}\n\n"
+            "Format:\n"
+            "[Key insight.]\n"
+            "[Non-trivial step.]\n"
+            "...\n"
+            "\\boxed{{answer}}"
         ),
         "output_tag": "phase3_correct",
     },
 }
 
 
-def get_phase_system_prompt(domain: str, phase: int) -> str:
+def get_phase_system_prompt(domain: str, phase: int, free_solve: bool = False) -> str:
     """
     Get the system prompt for a given (domain, phase) pair.
 
     Args:
         domain: One of: algebra, geometry, combinatorics, number_theory, miscellaneous
         phase: 0=Reformulate, 1=Verify, 2=Correct
+        free_solve: If True and phase==0, use the free-solve variant (no reference answer).
+                    Creates negative training examples when the model gets it wrong.
 
     Returns:
         System prompt string for the teacher model.
     """
     domain_desc = DOMAIN_EXPERT_DESCRIPTIONS.get(domain, DOMAIN_EXPERT_DESCRIPTIONS["miscellaneous"])
-    phase_info = PHASE_INSTRUCTIONS[phase]
+    key = "0_free" if (phase == 0 and free_solve) else phase
+    phase_info = PHASE_INSTRUCTIONS[key]
     return f"{domain_desc}\n\n{phase_info['title']}: {phase_info['instruction']}"
 
 
@@ -135,6 +162,7 @@ def get_phase_user_prompt(
     ground_truth: str = "",
     solve_trace: str = "",
     verify_trace: str = "",
+    free_solve: bool = False,
 ) -> str:
     """
     Get the user prompt for teacher trace generation.
@@ -158,7 +186,11 @@ def get_phase_user_prompt(
         User-turn message string.
     """
     if phase == 0:
-        # Phase 1: reformulate the provided correct solution in expert style
+        if free_solve:
+            # Free-solve: no reference — model must attempt the problem independently.
+            # Intentionally creates some wrong traces (natural negative examples).
+            return f"Problem:\n{problem}"
+        # Guided: reformulate the provided correct solution in expert style.
         ref = reference_solution.strip() if reference_solution.strip() else ground_truth.strip()
         return (
             f"Problem:\n{problem}\n\n"

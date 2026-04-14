@@ -38,7 +38,6 @@ class MultiHeadSelfAttention(nn.Module):
         super().__init__()
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
         inner_dim = n_heads * head_dim
 
         self.q_proj = nn.Linear(hidden_dim, inner_dim, bias=False)
@@ -59,19 +58,17 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)
 
-        # Scaled dot-product attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, T, T]
-
+        # Build additive attention mask: [B, 1, 1, T] in query dtype
+        attn_mask = None
         if attention_mask is not None:
-            # attention_mask: [B, T] with 1=attend, 0=mask
-            # Expand to [B, 1, 1, T] for broadcasting
-            mask = attention_mask[:, None, None, :].float()
-            attn = attn + (1.0 - mask) * -1e9
+            attn_mask = (1.0 - attention_mask[:, None, None, :].to(dtype=q.dtype)) * -1e4
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
+        # F.scaled_dot_product_attention dispatches to FlashAttention-2 automatically
+        # when flash_attn is installed, falling back to efficient SDPA otherwise.
+        # Handles scaling (1/sqrt(Dh)) and softmax internally.
+        dropout_p = self.dropout.p if self.training else 0.0
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
-        out = torch.matmul(attn, v)          # [B, H, T, Dh]
         out = out.transpose(1, 2).contiguous().view(B, T, H * Dh)
         return self.out_proj(out)
 

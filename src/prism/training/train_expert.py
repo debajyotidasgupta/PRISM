@@ -216,40 +216,56 @@ class ExpertTrainer:
             # Router: get phase weights (frozen during expert training)
             phase_weights, _ = self.model.router(h_K, attention_mask, phase_idx=None)
 
-        # ─ Run all phases 0..phase_idx ─
+        # ─ Run all phases 0..phase_idx (matching updated forward logic) ─
         domain_states = [h_K.clone() for _ in range(n_domains)]
+        phase_history = []    # stores domain state lists after each phase's CrossMix
+        phase_aggregates = [] # routing-weighted aggregate per phase
 
         for pi in range(self.phase_idx + 1):
             phase_blocks = self.model.expert_blocks[pi]
-            phase_outputs = []
+            w_phase = phase_weights[:, pi, :].detach()  # [B, n_domains] — routing constants
 
+            # Cross-phase: attend to prior phase states (frozen, but participates in autograd
+            # if target expert's output is in phase_history from a prior iteration)
+            if pi > 0 and not self.model._disable_crossphase:
+                with torch.no_grad():
+                    domain_states = self.model.cross_phase(domain_states, phase_history, attention_mask)
+
+            phase_outputs = []
             for di in range(n_domains):
                 is_target = (pi == self.phase_idx and di == self.domain_idx)
                 if is_target:
-                    # Trainable: compute with grad
+                    # Trainable: compute with full grad
                     out = phase_blocks[di](domain_states[di], attention_mask)
                 else:
-                    # Frozen: no grad needed (saves memory)
                     with torch.no_grad():
                         out = phase_blocks[di](domain_states[di], attention_mask)
                 phase_outputs.append(out)
 
-            # CrossMix at this level (frozen during expert training)
-            with torch.no_grad():
-                mixed_outputs = self.model.cross_mix[pi](phase_outputs, attention_mask)
+            # CrossMix: frozen params, but autograd must track this for grad to reach
+            # the target expert (loss → logits → h_K_prime → CrossMix → expert[target])
+            mixed_outputs = self.model.cross_mix[pi](phase_outputs, attention_mask)
 
             domain_states = mixed_outputs
+            phase_history.append([s.detach() for s in mixed_outputs])  # detached history
 
-        # ─ Aggregate at target phase level ─
-        # Use target phase's routing weights for aggregation
-        w = phase_weights[:, self.phase_idx, :]                # [B, n_domains]
-        w_expanded = w.unsqueeze(-1).unsqueeze(-1)             # [B, N, 1, 1]
-        stacked = torch.stack(domain_states, dim=1)             # [B, N, T, D]
-        h_K_prime = (w_expanded * stacked).sum(dim=1)           # [B, T, D]
+            # Compute routing-weighted aggregate for this phase (matches updated forward)
+            w = w_phase.unsqueeze(-1).unsqueeze(-1)       # [B, N, 1, 1]
+            stacked = torch.stack(mixed_outputs, dim=1)    # [B, N, T, D]
+            phase_agg = (w * stacked).sum(dim=1)           # [B, T, D]
+            phase_aggregates.append(phase_agg)
 
-        # ─ Backbone from insertion point (frozen) ─
-        with torch.no_grad():
-            logits = self.model._backbone_forward_from_K(h_K_prime, attention_mask)
+        # ─ Aggregate across phases (matches updated prism_model.py forward) ─
+        agg_mode = getattr(self.model.config, "phase_aggregate_mode", "mean")
+        if agg_mode == "last" or len(phase_aggregates) == 1:
+            h_K_prime = phase_aggregates[-1]
+        else:
+            h_K_prime = torch.stack(phase_aggregates, dim=0).mean(dim=0)  # [B, T, D]
+
+        # ─ Backbone from insertion point (frozen but participates in autograd) ─
+        # Do NOT use torch.no_grad() here: gradient must flow from loss → logits →
+        # h_K_prime → expert block parameters. Backbone params (frozen) get zero grad.
+        logits = self.model._backbone_forward_from_K(h_K_prime, attention_mask)
 
         # ─ LM loss on phase-specific traces ─
         from torch.nn import CrossEntropyLoss

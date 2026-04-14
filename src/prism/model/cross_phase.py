@@ -49,7 +49,6 @@ class CrossPhaseModule(nn.Module):
         self.n_domains = n_domains
         self.n_heads = n_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
         inner_dim = n_heads * head_dim
 
         # Per-domain query projections (current phase state → query)
@@ -110,18 +109,15 @@ class CrossPhaseModule(nn.Module):
             k = self.k_proj(prior_d).view(B, n_prior * T, H, Dh).transpose(1, 2)   # [B, H, P*T, Dh]
             v = self.v_proj(prior_d).view(B, n_prior * T, H, Dh).transpose(1, 2)   # [B, H, P*T, Dh]
 
-            attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, T, P*T]
-
-            # Replicate attention_mask for all prior-phase sequence positions
+            # Cross-phase attention: Q (current) → K/V (all prior phases concatenated)
+            attn_mask = None
             if attention_mask is not None:
                 full_mask = attention_mask.repeat(1, n_prior)  # [B, P*T]
-                full_mask = full_mask[:, None, None, :].to(dtype=attn.dtype)
-                attn = attn + (1.0 - full_mask) * -1e4
+                attn_mask = (1.0 - full_mask[:, None, None, :].to(dtype=q.dtype)) * -1e4
 
-            attn = F.softmax(attn.float(), dim=-1).to(dtype=q.dtype)
-            attn = self.dropout(attn)
-
-            out = torch.matmul(attn, v)                          # [B, H, T, Dh]
+            dropout_p = self.dropout.p if self.training else 0.0
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
+            # [B, H, T, Dh]
             out = out.transpose(1, 2).contiguous().view(B, T, H * Dh)
             out = self.out_projs[d](out)                          # [B, T, D]
 

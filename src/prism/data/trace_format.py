@@ -49,6 +49,7 @@ class TraceExample:
     correct_correct: bool = False
     total_tokens: int = 0
     image_path: Optional[str] = None
+    free_solve: bool = False   # True = Phase 1 had no reference → may be wrong (negative example)
 
     def to_dict(self) -> dict:
         return asdict(self)

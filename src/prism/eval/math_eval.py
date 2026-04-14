@@ -47,31 +47,82 @@ def load_math500_by_domain(n_per_domain: int = 25) -> list[dict]:
 
 def extract_boxed(text: str) -> str:
     """
-    Extract the content of the last \\boxed{...} in generated text.
-    Handles nested braces up to depth 3.
-    Falls back to last token if no boxed found.
+    Extract the final answer from PRISM-generated text.
+
+    PRISM generates three phases separated by double-newlines:
+        [solve_trace] \\n\\n [verify_trace] \\n\\n [correct_trace \\boxed{ans}]
+
+    Strategy:
+      1. Deduplicate repetition loops first.
+      2. Prefer the LAST phase (correct_trace) — most likely to have the final answer.
+      3. Extract the last \\boxed{...} from the correct_trace section first;
+         if not found there, scan earlier phases (fallback).
+      4. Handle truncated \\boxed{X (no closing brace) from token cutoff.
+      5. If no boxed at all, return last numeric-looking token.
     """
-    # Try to find \boxed{...} — note single backslash in the actual string
-    # r'\\boxed' in raw string = regex \\boxed = matches literal \boxed
-    matches = list(re.finditer(r'\\boxed\{', text))
-    if matches:
-        # Take the LAST match (most likely the final answer)
+    text = _dedup_repetition(text)
+
+    # Split by double-newline to separate phases
+    # Take the LAST non-empty section as the most likely correct_trace
+    sections = [s.strip() for s in text.split('\n\n') if s.strip()]
+
+    def _extract_last_boxed(s: str):
+        """Extract last \\boxed{} from a string; None if not found."""
+        matches = list(re.finditer(r'\\boxed\{', s))
+        if not matches:
+            return None
         m = matches[-1]
-        start = m.end()  # position after {
-        depth = 1
-        i = start
-        while i < len(text) and depth > 0:
-            if text[i] == '{':
+        start = m.end()
+        depth, i = 1, start
+        while i < len(s) and depth > 0:
+            if s[i] == '{':
                 depth += 1
-            elif text[i] == '}':
+            elif s[i] == '}':
                 depth -= 1
             i += 1
         if depth == 0:
-            return text[start:i-1].strip()
+            return s[start:i - 1].strip()
+        # Truncated — take whatever is inside
+        content = s[start:].rstrip()
+        return content if content else None
 
-    # Fallback: last non-empty token
+    # Try last section first, then work backwards (correct → verify → solve)
+    for section in reversed(sections):
+        result = _extract_last_boxed(section)
+        if result is not None:
+            return result
+
+    # No boxed found anywhere — last numeric token
     tokens = text.strip().split()
+    for tok in reversed(tokens):
+        tok_clean = tok.strip('.,;:')
+        if tok_clean and (tok_clean.lstrip('-').replace('.', '', 1).isdigit()
+                          or re.match(r'^[\d\\/\^_{}]+$', tok_clean)):
+            return tok_clean
     return tokens[-1] if tokens else ""
+
+
+def _dedup_repetition(text: str, min_len: int = 8, max_reps: int = 2) -> str:
+    """
+    Detect and truncate repetition loops in generated text.
+    If a substring of length >= min_len repeats > max_reps times consecutively,
+    keep only the first occurrence.
+    """
+    # Find the first repeated block of meaningful length
+    n = len(text)
+    for block_len in range(min(200, n // 3), min_len - 1, -1):
+        for start in range(n - block_len * (max_reps + 1) + 1):
+            block = text[start:start + block_len]
+            # Check if block repeats at least max_reps+1 times starting here
+            pos = start
+            reps = 0
+            while pos + block_len <= n and text[pos:pos + block_len] == block:
+                reps += 1
+                pos += block_len
+            if reps > max_reps:
+                # Keep text up to and including the first occurrence of the block
+                return text[:start + block_len]
+    return text
 
 
 def normalize_answer(ans: str) -> str:
@@ -108,7 +159,7 @@ def evaluate_model(
     model,
     tokenizer,
     n_per_domain: int = 25,
-    max_new_tokens: int = 256,
+    max_new_tokens: int = 1536,
     batch_size: int = 1,
     device: str = "cuda:0",
     log_fn=None,
@@ -145,20 +196,29 @@ def evaluate_model(
             domain = SUBJECT_TO_DOMAIN.get(subj, "miscellaneous")
             total_by_domain[domain] += 1
 
-            # Prompt: problem → solution
-            prompt = f"Problem: {ex['problem']}\n\nSolution:"
+            # Prompt format MUST match training format exactly:
+            #   training: [BOS][raw problem]\n\n[solve]\n\n[verify]\n\n[correct][EOS]
+            #   eval:     [BOS][raw problem]\n\n  ← model continues with solve phase
+            # "Problem:" prefix and "Solution:" suffix never appear in training.
+            prompt = ex['problem'] + "\n\n"
             enc = tokenizer(
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=512,
+                max_length=768,        # longer problem budget (some problems are verbose)
+                add_special_tokens=True,
             ).to(device)
 
+            # Generate the full solve→verify→correct chain.
+            # avg chain length: 520-1040 tokens; 1536 covers 99th percentile.
+            # Greedy (temp=0) is more stable for multi-phase structured output;
+            # repetition_penalty=1.15 gently discourages loops without scrambling math.
             out_ids = model.generate(
                 enc["input_ids"],
                 attention_mask=enc["attention_mask"],
                 max_new_tokens=max_new_tokens,
                 temperature=0.0,
+                repetition_penalty=1.15,
             )
             generated = tokenizer.decode(
                 out_ids[0][enc["input_ids"].shape[1]:],

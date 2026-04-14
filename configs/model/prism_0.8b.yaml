@@ -4,14 +4,18 @@
 backbone_name: "Qwen/Qwen3.5-0.8B"
 n_domains: 5
 n_phases: 3
-hidden_dim: 1536        # Qwen3.5-0.8B hidden dim (check with model.config.hidden_size)
-insert_layer: -1        # auto-detect at 65% depth
+hidden_dim: 1024        # Qwen3.5-0.8B actual hidden dim (verified: backbone.config.hidden_size=1024)
+insert_layer: -1        # auto-detect at ~62% depth (layer 15/24)
 expert_n_heads: 8
 expert_head_dim: 64
 expert_ffn_expansion: 4
 crossmix_n_heads: 4
+crossphase_n_heads: 2
+crossphase_head_dim: 32
+phase_aggregate_mode: "mean"   # "mean" | "last" — how to combine per-phase aggregates
 router_hidden_dim: 256
 router_dropout: 0.1
+router_temperature: 0.5        # <1 = sharper routing weights (more decisive)
 domains:
   - algebra
   - geometry

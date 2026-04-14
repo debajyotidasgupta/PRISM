@@ -994,12 +994,15 @@ class VLLMServerGenerator:
             )
             for i in range(N)
         ]
-        # Phase 1: full solution — up to max_new_tokens
-        # Phase 2: CORRECT/WRONG verdict + 4 sentences — 512 tokens is plenty
-        # Phase 3: polished solution — 2048 tokens
-        P1_TOKENS = self.max_new_tokens          # e.g. 4096
-        P2_TOKENS = min(512, self.max_new_tokens)
-        P3_TOKENS = min(2048, self.max_new_tokens)
+        # Per-phase token budgets — matching training collator budgets exactly:
+        #   solve:   256 tokens  (5-15 lines of math, ends with \boxed{})
+        #   verify:  128 tokens  (CORRECT/WRONG + ≤4 sentences of diagnosis)
+        #   correct: 256 tokens  (final polished trace, ends with \boxed{})
+        # These match the strict budgets in tokenize_full_trace() so training
+        # sequences are never truncated mid-solution.
+        P1_TOKENS = min(512, self.max_new_tokens)   # small headroom above 256 token target
+        P2_TOKENS = min(256, self.max_new_tokens)   # headroom above 128 token target
+        P3_TOKENS = min(512, self.max_new_tokens)   # headroom above 256 token target
 
         solve_traces = self._run_phase(p1, "Pass 1 (Reformulate/FreeSolve)", max_tokens=P1_TOKENS)
 

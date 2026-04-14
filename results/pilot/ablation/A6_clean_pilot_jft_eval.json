@@ -1,0 +1,33 @@
+{
+  "ablation": "A6_clean_pilot_jft",
+  "flags": {
+    "clean_traces": true,
+    "expert_epochs": 3,
+    "jft_epochs": 5,
+    "total_traces": 341,
+    "eval_gpus": 4
+  },
+  "overall": 0.032,
+  "domain": {
+    "algebra": 0.04,
+    "geometry": 0.12,
+    "combinatorics": 0.0,
+    "number_theory": 0.0,
+    "miscellaneous": 0.0
+  },
+  "correct": {
+    "algebra": 1,
+    "geometry": 3,
+    "combinatorics": 0,
+    "number_theory": 0,
+    "miscellaneous": 0
+  },
+  "total": {
+    "algebra": 25,
+    "geometry": 25,
+    "combinatorics": 25,
+    "number_theory": 25,
+    "miscellaneous": 25
+  },
+  "n_total": 125
+}
