@@ -3,11 +3,11 @@
   "verifier_domain": "geometry",
   "teacher": "Qwen/Qwen3.5-35B-A3B",
   "backend": "vllm_server",
-  "server_url": "http://localhost:8001",
+  "server_url": "http://localhost:8000",
   "total": 727,
   "phase1_correct": 0,
   "phase3_correct": 0,
   "token_filtered": 0,
-  "kept": 0,
-  "pass_rate": 0.0
+  "kept": 721,
+  "pass_rate": 0.9917469050894085
 }
